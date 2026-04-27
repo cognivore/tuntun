@@ -1,0 +1,56 @@
+[package]
+name = "tuntun_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "tuntun server daemon: tunnel acceptor, Caddy supervisor, auth endpoint."
+
+[[bin]]
+name = "tuntun-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tuntun_core = { workspace = true }
+tuntun_dns = { workspace = true }
+tuntun_auth = { workspace = true }
+tuntun_proto = { workspace = true }
+tuntun_caddy = { workspace = true }
+tuntun_config = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+argon2 = { workspace = true }
+
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+yamux = { workspace = true }
+reqwest = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+notify = { workspace = true }

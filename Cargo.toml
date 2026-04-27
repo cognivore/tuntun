@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tuntun_core",
+    "crates/tuntun_dns",
+    "crates/tuntun_auth",
+    "crates/tuntun_proto",
+    "crates/tuntun_caddy",
+    "crates/tuntun_config",
+    "crates/tuntun_cli",
+    "crates/tuntun_server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Jonn <jm@memorici.de>"]
+repository = "https://github.com/cognivore/tuntun"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# --- shared library dependencies (zero I/O acceptable) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+thiserror = "1"
+bytes = "1"
+async-trait = "0.1"
+futures-core = "0.3"
+postcard = { version = "1", features = ["use-std"] }
+
+# --- crypto (no I/O) ---
+argon2 = { version = "0.5", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["std", "rand_core", "pkcs8", "pem"] }
+subtle = "2"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand_core = "0.6"
+zeroize = { version = "1", features = ["derive"] }
+
+# --- I/O dependencies (allowed only in tuntun_cli and tuntun_server) ---
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["codec", "io", "compat"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+yamux = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "tokio", "macros", "json", "form", "query"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+notify = "6"
+dirs = "5"
+rand = "0.8"
+
+# --- internal crates ---
+tuntun_core = { path = "crates/tuntun_core" }
+tuntun_dns = { path = "crates/tuntun_dns" }
+tuntun_auth = { path = "crates/tuntun_auth" }
+tuntun_proto = { path = "crates/tuntun_proto" }
+tuntun_caddy = { path = "crates/tuntun_caddy" }
+tuntun_config = { path = "crates/tuntun_config" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
