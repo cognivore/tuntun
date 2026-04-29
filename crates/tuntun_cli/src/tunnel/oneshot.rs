@@ -46,6 +46,13 @@ type ControlStream = Compat<yamux::Stream>;
 
 pub struct OneShotSession {
     control: ControlStream,
+    /// Persistent decode buffer. The server frequently coalesces multiple
+    /// frames into a single TLS write (e.g. Welcome + AuthChallenge sent
+    /// back-to-back), so a single read() can return more than one frame's
+    /// bytes. Keeping the buffer across recv() calls means the leftover
+    /// bytes from one frame are available for the next, instead of being
+    /// silently dropped — which would manifest as a hang on the next read.
+    inbox: FrameBuffer,
     driver: JoinHandle<()>,
 }
 
@@ -69,6 +76,7 @@ impl OneShotSession {
             .await
             .map_err(|e| anyhow!("yamux open control stream: {e}"))?;
         let mut control = stream.compat();
+        let mut inbox = FrameBuffer::new();
 
         let driver = tokio::spawn(async move {
             let mut conn = yamux_conn;
@@ -90,7 +98,7 @@ impl OneShotSession {
             software_version: format!("tuntun-{client_label}/{SOFTWARE_VERSION}"),
         });
         write_frame(&mut control, &hello).await?;
-        match read_one_frame(&mut control).await? {
+        match read_one_frame(&mut control, &mut inbox).await? {
             ControlFrame::Welcome(w) if w.protocol_version == PROTOCOL_VERSION => {}
             ControlFrame::Welcome(w) => bail!(
                 "server protocol version {} != ours {PROTOCOL_VERSION}",
@@ -100,7 +108,7 @@ impl OneShotSession {
         }
 
         // Auth: receive challenge, sign, send response, receive result.
-        let challenge = match read_one_frame(&mut control).await? {
+        let challenge = match read_one_frame(&mut control, &mut inbox).await? {
             ControlFrame::AuthChallenge(c) => c,
             other => bail!("expected AuthChallenge, got {other:?}"),
         };
@@ -111,7 +119,7 @@ impl OneShotSession {
             public_key: Ed25519PublicKey::from_bytes(signing_key.verifying_key().to_bytes()),
         });
         write_frame(&mut control, &response).await?;
-        match read_one_frame(&mut control).await? {
+        match read_one_frame(&mut control, &mut inbox).await? {
             ControlFrame::AuthResult(r) => {
                 if !r.ok {
                     bail!("auth denied: {}", r.message.unwrap_or_default());
@@ -123,12 +131,16 @@ impl OneShotSession {
         // Empty Register so the server's protocol state machine advances.
         let register = ControlFrame::Register(RegisterFrame { projects: vec![] });
         write_frame(&mut control, &register).await?;
-        match read_one_frame(&mut control).await? {
+        match read_one_frame(&mut control, &mut inbox).await? {
             ControlFrame::Registered(_) => {}
             other => bail!("expected Registered, got {other:?}"),
         }
 
-        Ok(Self { control, driver })
+        Ok(Self {
+            control,
+            inbox,
+            driver,
+        })
     }
 
     pub async fn send(&mut self, frame: &ControlFrame) -> Result<()> {
@@ -136,7 +148,7 @@ impl OneShotSession {
     }
 
     pub async fn recv(&mut self) -> Result<ControlFrame> {
-        read_one_frame(&mut self.control).await
+        read_one_frame(&mut self.control, &mut self.inbox).await
     }
 
     pub fn close(self) {
@@ -183,18 +195,24 @@ where
     Ok(())
 }
 
-async fn read_one_frame<S>(s: &mut S) -> Result<ControlFrame>
+async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = FrameBuffer::new();
+    // First check if a complete frame is already buffered from a previous
+    // read that pulled in more than one frame's worth of bytes.
+    match inbox.try_pop_frame() {
+        Ok(Some(frame)) => return Ok(frame),
+        Ok(None) => {}
+        Err(e) => bail!("frame decode: {e}"),
+    }
     let mut chunk = [0u8; 4096];
     loop {
         match s.read(&mut chunk).await {
             Ok(0) => bail!("unexpected EOF on control stream"),
             Ok(n) => {
-                buf.push(&chunk[..n]);
-                match buf.try_pop_frame() {
+                inbox.push(&chunk[..n]);
+                match inbox.try_pop_frame() {
                     Ok(Some(frame)) => return Ok(frame),
                     Ok(None) => continue,
                     Err(e) => bail!("frame decode: {e}"),

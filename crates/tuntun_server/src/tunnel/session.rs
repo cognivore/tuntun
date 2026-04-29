@@ -161,8 +161,13 @@ pub async fn handle_connection(
         }
     });
 
+    // Persistent decode buffer for the control stream. Keeping leftover
+    // bytes between read_one_frame calls prevents losing the second frame
+    // when the client coalesces two frames into one TLS write.
+    let mut control_inbox = FrameBuffer::new();
+
     // 4. Receive Hello.
-    let hello = read_one_frame(&mut control).await?;
+    let hello = read_one_frame(&mut control, &mut control_inbox).await?;
     let ControlFrame::Hello(hello) = hello else {
         return Err(anyhow!("expected Hello, got {hello:?}"));
     };
@@ -189,7 +194,7 @@ pub async fn handle_connection(
     let challenge = ControlFrame::AuthChallenge(AuthChallengeFrame { nonce });
     write_frame(&mut control, &challenge).await?;
 
-    let response = read_one_frame(&mut control).await?;
+    let response = read_one_frame(&mut control, &mut control_inbox).await?;
     let ControlFrame::AuthResponse(response) = response else {
         return Err(anyhow!("expected AuthResponse, got {response:?}"));
     };
@@ -219,7 +224,7 @@ pub async fn handle_connection(
     );
 
     // 6. Register frame.
-    let register_frame = read_one_frame(&mut control).await?;
+    let register_frame = read_one_frame(&mut control, &mut control_inbox).await?;
     let ControlFrame::Register(register) = register_frame else {
         return Err(anyhow!("expected Register, got {register_frame:?}"));
     };
@@ -333,6 +338,7 @@ pub async fn handle_connection(
     // handles inbound Ping / Deregister / BlessKey frames.
     let writer_result = control_loop(
         &mut control,
+        &mut control_inbox,
         control_rx,
         control_tx,
         tenant.clone(),
@@ -437,6 +443,7 @@ async fn stream_opener(
 
 async fn control_loop<S>(
     control: &mut S,
+    inbox: &mut FrameBuffer,
     mut control_rx: mpsc::Receiver<ControlFrame>,
     control_tx: mpsc::Sender<ControlFrame>,
     tenant: TenantId,
@@ -455,7 +462,7 @@ where
                     None => return Ok(()),
                 }
             }
-            inbound = read_one_frame_opt(control) => {
+            inbound = read_one_frame_opt(control, inbox) => {
                 match inbound? {
                     Some(ControlFrame::Ping(p)) => {
                         let pong = ControlFrame::Pong(PongFrame { nonce: p.nonce });
@@ -740,34 +747,46 @@ fn generate_nonce() -> Nonce {
     Nonce::from_bytes(buf)
 }
 
-async fn read_one_frame<S>(s: &mut S) -> Result<ControlFrame>
+async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    match read_one_frame_opt(s).await? {
+    match read_one_frame_opt(s, inbox).await? {
         Some(f) => Ok(f),
         None => Err(anyhow!("unexpected EOF on control stream")),
     }
 }
 
 /// Read one frame; returns `Ok(None)` on clean EOF before any bytes.
-async fn read_one_frame_opt<S>(s: &mut S) -> Result<Option<ControlFrame>>
+///
+/// The `inbox` is shared across calls so leftover bytes from a previous
+/// read (when one TLS read carried more than one frame) are preserved.
+/// Without that, frames coalesced on the wire would silently disappear
+/// after the first one is popped.
+async fn read_one_frame_opt<S>(
+    s: &mut S,
+    inbox: &mut FrameBuffer,
+) -> Result<Option<ControlFrame>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = FrameBuffer::new();
+    match inbox.try_pop_frame() {
+        Ok(Some(frame)) => return Ok(Some(frame)),
+        Ok(None) => {}
+        Err(e) => return Err(anyhow!("frame decode: {e}")),
+    }
     let mut chunk = [0u8; 4096];
     loop {
         match s.read(&mut chunk).await {
             Ok(0) => {
-                if buf.is_empty() {
+                if inbox.is_empty() {
                     return Ok(None);
                 }
                 return Err(anyhow!("EOF mid-frame"));
             }
             Ok(n) => {
-                buf.push(&chunk[..n]);
-                match buf.try_pop_frame() {
+                inbox.push(&chunk[..n]);
+                match inbox.try_pop_frame() {
                     Ok(Some(frame)) => return Ok(Some(frame)),
                     Ok(None) => continue,
                     Err(e) => return Err(anyhow!("frame decode: {e}")),

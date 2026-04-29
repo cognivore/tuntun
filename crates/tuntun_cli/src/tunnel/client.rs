@@ -158,6 +158,11 @@ impl TunnelClient {
                 .await
                 .map_err(|e| anyhow!("yamux open control stream: {e}"))?;
         let mut control = control_stream.compat();
+        // Persistent decode buffer threaded through every read on `control`.
+        // A single TLS read can carry more than one frame (the server pipes
+        // Welcome + AuthChallenge back-to-back, etc.); keeping leftover
+        // bytes between reads is the difference between progress and a hang.
+        let mut control_inbox = FrameBuffer::new();
 
         // Spawn the driver — it owns yamux_conn outright and pumps inbound
         // streams. From here on the handshake task uses only `control`,
@@ -216,7 +221,7 @@ impl TunnelClient {
         write_frame(&mut control, &hello).await?;
 
         // 6. Receive Welcome.
-        let welcome = read_one_frame(&mut control).await?;
+        let welcome = read_one_frame(&mut control, &mut control_inbox).await?;
         let ControlFrame::Welcome(welcome) = welcome else {
             return Err(anyhow!("expected Welcome, got {welcome:?}"));
         };
@@ -233,7 +238,7 @@ impl TunnelClient {
         // challenge — the server may also push the challenge unsolicited.)
         // For the simple flow specified in CLAUDE.md the server sends the
         // challenge directly after Welcome.
-        let challenge_or_req = read_one_frame(&mut control).await?;
+        let challenge_or_req = read_one_frame(&mut control, &mut control_inbox).await?;
         let challenge = match challenge_or_req {
             ControlFrame::AuthChallenge(c) => c,
             other => return Err(anyhow!("expected AuthChallenge, got {other:?}")),
@@ -249,7 +254,7 @@ impl TunnelClient {
         write_frame(&mut control, &response).await?;
 
         // 9. Receive AuthResult.
-        let auth_result = read_one_frame(&mut control).await?;
+        let auth_result = read_one_frame(&mut control, &mut control_inbox).await?;
         let ControlFrame::AuthResult(auth_result) = auth_result else {
             return Err(anyhow!("expected AuthResult, got {auth_result:?}"));
         };
@@ -268,7 +273,7 @@ impl TunnelClient {
         write_frame(&mut control, &register).await?;
 
         // 11. Receive Registered.
-        let registered = read_one_frame(&mut control).await?;
+        let registered = read_one_frame(&mut control, &mut control_inbox).await?;
         let ControlFrame::Registered(registered) = registered else {
             return Err(anyhow!("expected Registered, got {registered:?}"));
         };
@@ -281,8 +286,14 @@ impl TunnelClient {
         // before the handshake; once Register completes the server is free
         // to open new inbound streams and the acceptor will pick them up
         // and pair each with a routing entry.
-        let control_loop_result =
-            run_control_loop(&mut control, routing_seed, ssh_local_port, routing.clone()).await;
+        let control_loop_result = run_control_loop(
+            &mut control,
+            &mut control_inbox,
+            routing_seed,
+            ssh_local_port,
+            routing.clone(),
+        )
+        .await;
 
         // Make sure the acceptor doesn't hold onto yamux past disconnect.
         acceptor.abort();
@@ -346,6 +357,7 @@ fn build_register_frame(
 
 async fn run_control_loop<S>(
     control: &mut S,
+    inbox: &mut FrameBuffer,
     local_routing: BTreeMap<(ProjectId, ServiceName), LocalPort>,
     ssh_local_port: LocalPort,
     routing: Arc<Mutex<StreamRouting>>,
@@ -354,7 +366,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let frame = match read_one_frame_opt(control).await? {
+        let frame = match read_one_frame_opt(control, inbox).await? {
             Some(f) => f,
             None => return Ok(()),
         };
@@ -436,33 +448,45 @@ async fn pump_stream_to_local(yamux_stream: yamux::Stream, port: LocalPort) -> R
     Ok(())
 }
 
-async fn read_one_frame<S>(s: &mut S) -> Result<ControlFrame>
+async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    match read_one_frame_opt(s).await? {
+    match read_one_frame_opt(s, inbox).await? {
         Some(f) => Ok(f),
         None => Err(anyhow!("unexpected EOF on control stream")),
     }
 }
 
-async fn read_one_frame_opt<S>(s: &mut S) -> Result<Option<ControlFrame>>
+/// Read one frame, sharing a persistent `inbox` across calls. A single TLS
+/// read can return more than one frame's bytes when the server coalesces
+/// writes (Welcome + AuthChallenge are sent back-to-back, for instance), so
+/// the inbox preserves leftover bytes after a frame is popped — otherwise
+/// the next read silently waits forever for bytes that already arrived.
+async fn read_one_frame_opt<S>(
+    s: &mut S,
+    inbox: &mut FrameBuffer,
+) -> Result<Option<ControlFrame>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = FrameBuffer::new();
+    match inbox.try_pop_frame() {
+        Ok(Some(frame)) => return Ok(Some(frame)),
+        Ok(None) => {}
+        Err(e) => return Err(anyhow!("frame decode: {e}")),
+    }
     let mut chunk = [0u8; 4096];
     loop {
         match s.read(&mut chunk).await {
             Ok(0) => {
-                if buf.is_empty() {
+                if inbox.is_empty() {
                     return Ok(None);
                 }
                 return Err(anyhow!("EOF mid-frame"));
             }
             Ok(n) => {
-                buf.push(&chunk[..n]);
-                match buf.try_pop_frame() {
+                inbox.push(&chunk[..n]);
+                match inbox.try_pop_frame() {
                     Ok(Some(frame)) => return Ok(Some(frame)),
                     Ok(None) => continue,
                     Err(e) => return Err(anyhow!("frame decode: {e}")),
