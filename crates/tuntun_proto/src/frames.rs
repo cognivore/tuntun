@@ -80,6 +80,18 @@ pub enum ControlFrame {
     BlessKey(BlessKeyFrame),
     /// Server -> Client. Outcome of a [`BlessKeyFrame`].
     BlessKeyAck(BlessKeyAckFrame),
+
+    /// Client -> Server. Remove every line in the tenant's `bless.keys`
+    /// whose trailing-comment label matches `label` exactly.
+    UnblessKey(UnblessKeyFrame),
+    /// Server -> Client. Outcome of an [`UnblessKeyFrame`].
+    UnblessKeyAck(UnblessKeyAckFrame),
+
+    /// Client -> Server. Ask for the current contents of the tenant's
+    /// `bless.keys`.
+    ListBlessings(ListBlessingsFrame),
+    /// Server -> Client. Reply to a [`ListBlessingsFrame`].
+    BlessingsList(BlessingsListFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -380,4 +392,47 @@ pub struct BlessKeyFrame {
 pub struct BlessKeyAckFrame {
     pub ok: bool,
     pub message: Option<String>,
+}
+
+/// Client -> Server: remove all bless.keys lines whose label exactly
+/// matches `label`. Typically used to revoke a `tuntun bless` for a
+/// specific `user@host`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnblessKeyFrame {
+    pub label: String,
+}
+
+/// Server -> Client: outcome of an unbless. `removed` is the number of
+/// lines actually deleted; zero is not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnblessKeyAckFrame {
+    pub ok: bool,
+    pub removed: u32,
+    pub message: Option<String>,
+}
+
+/// Client -> Server: empty marker requesting the current list of blessed
+/// keys for the connecting tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ListBlessingsFrame {}
+
+/// One row in the bless.keys file, decoded for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlessingEntry {
+    /// The SSH key algorithm name, e.g. `"ssh-ed25519"`.
+    pub algorithm: String,
+    /// The wire-format public key body, base64-encoded (RFC 4253 §6.6).
+    /// This is the second whitespace-separated field of an OpenSSH
+    /// `authorized_keys` line.
+    pub public_key_b64: String,
+    /// Free-form trailing label (everything after the second field on
+    /// the line). For keys minted by `tuntun bless` this is the
+    /// `tuntun-bless-<tenant>-<user@host>` we wrote at bless time.
+    pub label: String,
+}
+
+/// Server -> Client: response to a [`ListBlessingsFrame`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BlessingsListFrame {
+    pub entries: Vec<BlessingEntry>,
 }

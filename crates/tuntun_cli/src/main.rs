@@ -120,6 +120,16 @@ enum Command {
         /// SSH target, e.g. `me@my-other-laptop`.
         target: String,
     },
+
+    /// Revoke a previously-blessed bastion key by `user@host` (matched
+    /// by canonical label `tuntun-bless-<tenant>-<target>`).
+    Unbless {
+        /// SSH target whose key should be revoked, e.g. `me@my-other-laptop`.
+        target: String,
+    },
+
+    /// List the bastion keys currently authorized for this tenant.
+    Blessings,
 }
 
 fn main() -> ExitCode {
@@ -164,6 +174,10 @@ fn main() -> ExitCode {
             Command::Bless { target } => {
                 commands::bless::run(&target, cli.config.as_deref()).await
             }
+            Command::Unbless { target } => {
+                commands::unbless::run(&target, cli.config.as_deref()).await
+            }
+            Command::Blessings => commands::blessings::run(cli.config.as_deref()).await,
         }
     });
 

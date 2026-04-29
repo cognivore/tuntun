@@ -16,12 +16,13 @@ use tuntun_core::{
 };
 use tuntun_proto::{
     decode_frame, encode_frame, AuthChallengeFrame, AuthPolicy, AuthRequestFrame,
-    AuthResponseFrame, AuthResultFrame, BlessKeyAckFrame, BlessKeyFrame, BuiltinService,
-    ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame, FrameBuffer, HealthCheckSpec,
-    HelloFrame, PingFrame, PongFrame, ProjectRegistration, ProtoError, RegisterFrame,
-    RegisteredFrame, ServiceAllocation, ServiceRegistration, StreamCloseFrame, StreamCloseReason,
-    StreamDataFrame, StreamOpenBuiltinFrame, StreamOpenFrame, WelcomeFrame, MAX_FRAME_LEN,
-    PROTOCOL_VERSION,
+    AuthResponseFrame, AuthResultFrame, BlessKeyAckFrame, BlessKeyFrame, BlessingEntry,
+    BlessingsListFrame, BuiltinService, ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame,
+    FrameBuffer, HealthCheckSpec, HelloFrame, ListBlessingsFrame, PingFrame, PongFrame,
+    ProjectRegistration, ProtoError, RegisterFrame, RegisteredFrame, ServiceAllocation,
+    ServiceRegistration, StreamCloseFrame, StreamCloseReason, StreamDataFrame,
+    StreamOpenBuiltinFrame, StreamOpenFrame, UnblessKeyAckFrame, UnblessKeyFrame, WelcomeFrame,
+    MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 
 fn tenant() -> TenantId {
@@ -185,6 +186,22 @@ fn all_frames() -> Vec<ControlFrame> {
         ControlFrame::BlessKeyAck(BlessKeyAckFrame {
             ok: false,
             message: Some("appendable failure".to_string()),
+        }),
+        ControlFrame::UnblessKey(UnblessKeyFrame {
+            label: "tuntun-bless-sweater-user@host".to_string(),
+        }),
+        ControlFrame::UnblessKeyAck(UnblessKeyAckFrame {
+            ok: true,
+            removed: 1,
+            message: None,
+        }),
+        ControlFrame::ListBlessings(ListBlessingsFrame::default()),
+        ControlFrame::BlessingsList(BlessingsListFrame {
+            entries: vec![BlessingEntry {
+                algorithm: "ssh-ed25519".to_string(),
+                public_key_b64: "AAAAC3NzaC1lZDI1NTE5AAAAI".repeat(2),
+                label: "tuntun-bless-sweater-user@host".to_string(),
+            }],
         }),
     ]
 }

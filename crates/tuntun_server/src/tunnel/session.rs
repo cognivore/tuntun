@@ -43,8 +43,8 @@ use tuntun_core::{
 };
 use tuntun_proto::{
     encode_frame, AuthChallengeFrame, AuthPolicy as ProtoAuthPolicy, AuthResultFrame,
-    BlessKeyAckFrame, ControlFrame, FrameBuffer, PongFrame, RegisteredFrame, ServiceAllocation,
-    WelcomeFrame, PROTOCOL_VERSION,
+    BlessKeyAckFrame, BlessingEntry, BlessingsListFrame, ControlFrame, FrameBuffer, PongFrame,
+    RegisteredFrame, ServiceAllocation, UnblessKeyAckFrame, WelcomeFrame, PROTOCOL_VERSION,
 };
 
 use crate::caddy_supervisor::CaddySupervisor;
@@ -486,6 +486,51 @@ where
                         };
                         write_frame(control, &ControlFrame::BlessKeyAck(ack)).await?;
                     }
+                    Some(ControlFrame::UnblessKey(req)) => {
+                        let ack = match remove_blessed_keys_by_label(
+                            &state_dir, &tenant, &req.label,
+                        )
+                        .await
+                        {
+                            Ok(removed) => {
+                                tracing::info!(
+                                    "unblessed {removed} key(s) for tenant {tenant} \
+                                     matching label {label:?}",
+                                    label = req.label,
+                                );
+                                UnblessKeyAckFrame {
+                                    ok: true,
+                                    removed,
+                                    message: None,
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "unbless failed for tenant {tenant}: {e:#}"
+                                );
+                                UnblessKeyAckFrame {
+                                    ok: false,
+                                    removed: 0,
+                                    message: Some(format!("{e:#}")),
+                                }
+                            }
+                        };
+                        write_frame(control, &ControlFrame::UnblessKeyAck(ack)).await?;
+                    }
+                    Some(ControlFrame::ListBlessings(_)) => {
+                        let entries = read_blessings(&state_dir, &tenant).await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "list blessings failed for tenant {tenant}: {e:#}"
+                                );
+                                Vec::new()
+                            });
+                        write_frame(
+                            control,
+                            &ControlFrame::BlessingsList(BlessingsListFrame { entries }),
+                        )
+                        .await?;
+                    }
                     Some(other) => {
                         tracing::debug!("ignoring inbound control frame: {other:?}");
                     }
@@ -574,6 +619,119 @@ fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
     buf.extend_from_slice(&32u32.to_be_bytes());
     buf.extend_from_slice(raw);
     STANDARD.encode(&buf)
+}
+
+/// Read every entry from `<state_dir>/tenants/<tenant>/bless.keys` and
+/// return it parsed. Lines are split on whitespace into three fields —
+/// algorithm, base64-body, label (which may be empty). Lines that don't
+/// have at least two fields are skipped silently; comment lines (`# …`)
+/// and blank lines are dropped. A missing file is treated as "no
+/// blessings" and yields an empty Vec.
+async fn read_blessings(
+    state_dir: &std::path::Path,
+    tenant: &TenantId,
+) -> Result<Vec<BlessingEntry>> {
+    let path = state_dir
+        .join("tenants")
+        .join(tenant.as_str())
+        .join("bless.keys");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+    };
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, char::is_whitespace);
+        let alg = match parts.next() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let body = match parts.next() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let label = parts.next().unwrap_or("").trim().to_string();
+        out.push(BlessingEntry {
+            algorithm: alg,
+            public_key_b64: body,
+            label,
+        });
+    }
+    Ok(out)
+}
+
+/// Atomically rewrite `bless.keys`, dropping any line whose label exactly
+/// matches `target_label` (after the same CR/LF + length sanitization that
+/// `append_blessed_key` applied at insertion time, so an unbless will hit
+/// what a bless previously wrote). Returns the number of lines removed.
+async fn remove_blessed_keys_by_label(
+    state_dir: &std::path::Path,
+    tenant: &TenantId,
+    target_label: &str,
+) -> Result<u32> {
+    let path = state_dir
+        .join("tenants")
+        .join(tenant.as_str())
+        .join("bless.keys");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+    };
+    let canonical: String = target_label
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(128)
+        .collect();
+
+    let mut removed: u32 = 0;
+    let mut kept = String::with_capacity(text.len());
+    for raw in text.split_inclusive('\n') {
+        // Re-derive the label from each line for comparison.
+        let line = raw.trim_end_matches(['\n', '\r']);
+        if line.is_empty() || line.starts_with('#') {
+            kept.push_str(raw);
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
+        let line_label = parts.get(2).map_or("", |s| s.trim());
+        if line_label == canonical {
+            removed = removed.saturating_add(1);
+        } else {
+            kept.push_str(raw);
+        }
+    }
+
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    // Write atomically via a sibling temp file + rename so we don't leave
+    // a partial file if the daemon crashes mid-write.
+    let tmp = path.with_extension("keys.tmp");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o640);
+    let mut f = opts
+        .open(&tmp)
+        .await
+        .with_context(|| format!("open temp {}", tmp.display()))?;
+    use tokio::io::AsyncWriteExt as _;
+    f.write_all(kept.as_bytes())
+        .await
+        .with_context(|| format!("write {}", tmp.display()))?;
+    f.flush().await?;
+    drop(f);
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(removed)
 }
 
 fn generate_nonce() -> Nonce {
