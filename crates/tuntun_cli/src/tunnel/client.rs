@@ -25,11 +25,11 @@ use tuntun_core::{
     ServiceName, TenantId, TunnelClientId,
 };
 use tuntun_proto::{
-    encode_frame, AuthResponseFrame, ControlFrame, FrameBuffer, HelloFrame, ProjectRegistration,
-    RegisterFrame, ServiceRegistration, PROTOCOL_VERSION,
+    encode_frame, AuthResponseFrame, BuiltinService, ControlFrame, FrameBuffer, HelloFrame,
+    ProjectRegistration, RegisterFrame, ServiceRegistration, PROTOCOL_VERSION,
 };
 
-use crate::adapters::secret::PassveilSecrets;
+use crate::adapters::secret::RageveilSecrets;
 use crate::config::DaemonConfig;
 use crate::tls::build_pinned_client_config;
 use crate::tunnel::reconnect::BackoffState;
@@ -110,13 +110,13 @@ impl TunnelClient {
     }
 
     async fn load_signing_key(&self) -> Result<SigningKey> {
-        let secrets = PassveilSecrets::new();
+        let secrets = RageveilSecrets::new();
         let key_name = SecretKey::new(self.config.private_key_secret_name.clone())
             .map_err(|e| anyhow!("invalid private_key_secret_name: {e}"))?;
         let value = secrets
             .load(&key_name)
             .await
-            .context("load tunnel private key from passveil")?;
+            .context("load tunnel private key from rageveil")?;
         let pem = std::str::from_utf8(value.expose_bytes())
             .context("private key is not utf-8")?;
         SigningKey::from_pkcs8_pem(pem)
@@ -143,7 +143,12 @@ impl TunnelClient {
             .await
             .map_err(|e| anyhow!("tls connect: {e}"))?;
 
-        // 3. Yamux client.
+        // 3. Yamux client. We open the single outbound (control) stream
+        // *before* moving the Connection into the driver task, so the driver
+        // can own it exclusively and `poll_next_inbound` it forever. The
+        // resulting Stream has its own buffer and does not require the
+        // Connection to read/write — but the Connection must keep being
+        // polled, otherwise nothing flows.
         let mut yamux_conn =
             YamuxConnection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
 
@@ -153,6 +158,49 @@ impl TunnelClient {
                 .await
                 .map_err(|e| anyhow!("yamux open control stream: {e}"))?;
         let mut control = control_stream.compat();
+
+        // Spawn the driver — it owns yamux_conn outright and pumps inbound
+        // streams. From here on the handshake task uses only `control`,
+        // which is independent of `yamux_conn`'s ownership.
+        let routing: Arc<Mutex<StreamRouting>> = Arc::new(Mutex::new(StreamRouting::new()));
+        let ssh_local_port = LocalPort::new(self.config.ssh_local_port)
+            .map_err(|e| anyhow!("ssh_local_port {}: {e}", self.config.ssh_local_port))?;
+        let routing_for_acceptor = routing.clone();
+        let acceptor = tokio::spawn(async move {
+            let mut conn = yamux_conn;
+            loop {
+                let res = poll_fn(|cx| {
+                    std::pin::Pin::new(&mut conn).poll_next_inbound(cx)
+                })
+                .await;
+                match res {
+                    None => break,
+                    Some(Ok(stream)) => {
+                        let id = stream.id().val();
+                        let port = wait_for_routing(&routing_for_acceptor, id).await;
+                        match port {
+                            Some(p) => {
+                                tokio::spawn(async move {
+                                    if let Err(e) = pump_stream_to_local(stream, p).await {
+                                        tracing::debug!("stream {id}: {e}");
+                                    }
+                                });
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "no routing entry for inbound yamux stream id={id}"
+                                );
+                                drop(stream);
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::debug!("yamux accept: {e}");
+                        break;
+                    }
+                }
+            }
+        });
 
         // 5. Send Hello.
         let client_id_str =
@@ -229,56 +277,12 @@ impl TunnelClient {
             registered.allocations.len()
         );
 
-        // 12. Run the multiplexer.
-        let routing: Arc<Mutex<StreamRouting>> = Arc::new(Mutex::new(StreamRouting::new()));
-        let yamux_arc = Arc::new(Mutex::new(yamux_conn));
-
-        // Inbound-yamux acceptor: accept new streams from the server, look
-        // up the local-port routing.
-        let acceptor_yamux = yamux_arc.clone();
-        let acceptor_routing = routing.clone();
-        let acceptor = tokio::spawn(async move {
-            loop {
-                let mut conn = acceptor_yamux.lock().await;
-                let res = poll_fn(|cx| {
-                    std::pin::Pin::new(&mut *conn).poll_next_inbound(cx)
-                })
-                .await;
-                drop(conn);
-                match res {
-                    None => break,
-                    Some(Ok(stream)) => {
-                        let id = stream.id().val();
-                        // Wait briefly for the StreamOpen frame to populate
-                        // the routing table.
-                        let port = wait_for_routing(&acceptor_routing, id).await;
-                        match port {
-                            Some(p) => {
-                                tokio::spawn(async move {
-                                    if let Err(e) = pump_stream_to_local(stream, p).await {
-                                        tracing::debug!("stream {id}: {e}");
-                                    }
-                                });
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "no routing entry for inbound yamux stream id={id}"
-                                );
-                                drop(stream);
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        tracing::debug!("yamux accept: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Control-frame reader loop: read inbound frames forever.
+        // 12. Run the control loop. The yamux acceptor was already spawned
+        // before the handshake; once Register completes the server is free
+        // to open new inbound streams and the acceptor will pick them up
+        // and pair each with a routing entry.
         let control_loop_result =
-            run_control_loop(&mut control, routing_seed, routing.clone()).await;
+            run_control_loop(&mut control, routing_seed, ssh_local_port, routing.clone()).await;
 
         // Make sure the acceptor doesn't hold onto yamux past disconnect.
         acceptor.abort();
@@ -312,7 +316,6 @@ fn build_register_frame(
             let auth_policy = match svc_spec.auth {
                 tuntun_config::AuthPolicy::Tenant => tuntun_proto::AuthPolicy::Tenant,
                 tuntun_config::AuthPolicy::Public => tuntun_proto::AuthPolicy::Public,
-                tuntun_config::AuthPolicy::None => tuntun_proto::AuthPolicy::None,
             };
             let health = svc_spec.health_check.as_ref().map(|h| {
                 tuntun_proto::HealthCheckSpec {
@@ -344,6 +347,7 @@ fn build_register_frame(
 async fn run_control_loop<S>(
     control: &mut S,
     local_routing: BTreeMap<(ProjectId, ServiceName), LocalPort>,
+    ssh_local_port: LocalPort,
     routing: Arc<Mutex<StreamRouting>>,
 ) -> Result<()>
 where
@@ -368,6 +372,17 @@ where
                     );
                 }
             }
+            ControlFrame::StreamOpenBuiltin(open) => match open.kind {
+                BuiltinService::Ssh => {
+                    let mut r = routing.lock().await;
+                    r.insert(open.stream_id, ssh_local_port);
+                    tracing::debug!(
+                        "builtin ssh stream {} -> 127.0.0.1:{}",
+                        open.stream_id,
+                        ssh_local_port.value()
+                    );
+                }
+            },
             ControlFrame::Ping(p) => {
                 let pong = ControlFrame::Pong(tuntun_proto::PongFrame { nonce: p.nonce });
                 write_frame(control, &pong).await?;

@@ -31,7 +31,7 @@ pub use crate::error::{Error, Result};
 pub use crate::http::{HttpHeader, HttpMethod, HttpRequest, HttpResponse, HttpStatus, HttpUrl};
 pub use crate::id::IdError;
 pub use crate::ids::{
-    DnsRecordId, Domain, Fqdn, LocalPort, ProjectId, SecretKey, ServiceName, ServicePort,
+    DnsName, DnsRecordId, Domain, Fqdn, LocalPort, ProjectId, SecretKey, ServiceName, ServicePort,
     Subdomain, TenantId, Ttl, TunnelClientId,
 };
 pub use crate::ports::{

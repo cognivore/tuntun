@@ -112,6 +112,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // rustls 0.23 demands a process-level CryptoProvider before any TLS code
+    // runs. We pin `ring` to match the workspace feature flag.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     if let Err(e) = init_tracing(cli.verbose) {

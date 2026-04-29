@@ -31,8 +31,8 @@ pub use codec::{decode_frame, encode_frame, FrameBuffer, MAX_FRAME_LEN};
 pub use error::ProtoError;
 pub use frames::{
     AuthChallengeFrame, AuthPolicy, AuthRequestFrame, AuthResponseFrame, AuthResultFrame,
-    ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame, HealthCheckSpec, HelloFrame,
-    PingFrame, PongFrame, ProjectRegistration, RegisterFrame, RegisteredFrame,
+    BuiltinService, ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame, HealthCheckSpec,
+    HelloFrame, PingFrame, PongFrame, ProjectRegistration, RegisterFrame, RegisteredFrame,
     ServiceAllocation, ServiceRegistration, StreamCloseFrame, StreamCloseReason,
-    StreamDataFrame, StreamOpenFrame, WelcomeFrame, PROTOCOL_VERSION,
+    StreamDataFrame, StreamOpenBuiltinFrame, StreamOpenFrame, WelcomeFrame, PROTOCOL_VERSION,
 };

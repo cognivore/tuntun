@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use crate::dns::{DnsRecord, DnsRecordKind, DnsRecordSpec};
 use crate::error::{Error, Result};
 use crate::http::{HttpRequest, HttpResponse, HttpStatus};
-use crate::ids::{DnsRecordId, Domain, SecretKey, Subdomain};
+use crate::ids::{DnsName, DnsRecordId, Domain, SecretKey};
 use crate::ports::{ClockPort, DnsPort, FsPath, FsPort, HttpPort, ProcessPort, SecretPort};
 use crate::process::{ProcessExit, ProcessExitCode, ProcessSpec};
 use crate::secret::SecretValue;
@@ -108,8 +108,8 @@ pub struct MockDns {
 
 #[derive(Debug, Default)]
 struct MockDnsInner {
-    /// (domain, subdomain, kind) -> record
-    records: HashMap<(Domain, Subdomain, DnsRecordKind), DnsRecord>,
+    /// (domain, name, kind) -> record
+    records: HashMap<(Domain, DnsName, DnsRecordKind), DnsRecord>,
     next_id: u64,
 }
 
@@ -173,7 +173,7 @@ impl DnsPort for MockDns {
     async fn delete_record(
         &self,
         domain: &Domain,
-        name: &Subdomain,
+        name: &DnsName,
         kind: DnsRecordKind,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("mock-dns lock");
@@ -400,7 +400,7 @@ impl FsPort for MockFs {
 mod tests {
     use super::*;
     use crate::dns::DnsRecordContent;
-    use crate::ids::{Subdomain, Ttl};
+    use crate::ids::Ttl;
     use std::net::Ipv4Addr;
 
     #[tokio::test]
@@ -408,7 +408,7 @@ mod tests {
         let dns = MockDns::new();
         let spec = DnsRecordSpec {
             apex: Domain::new("example.com").unwrap(),
-            name: Subdomain::new("blog").unwrap(),
+            name: DnsName::new("blog").unwrap(),
             ttl: Ttl::new(60).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(1, 2, 3, 4),

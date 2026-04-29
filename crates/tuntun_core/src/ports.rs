@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::dns::{DnsRecord, DnsRecordKind, DnsRecordSpec};
 use crate::error::Result;
 use crate::http::{HttpRequest, HttpResponse};
-use crate::ids::{Domain, DnsRecordId, SecretKey, Subdomain};
+use crate::ids::{DnsName, Domain, DnsRecordId, SecretKey};
 use crate::process::{ProcessExit, ProcessSpec};
 use crate::secret::SecretValue;
 use crate::time::{Instant, Timestamp};
@@ -60,7 +60,7 @@ pub trait DnsPort: Send + Sync {
     async fn delete_record(
         &self,
         domain: &Domain,
-        name: &Subdomain,
+        name: &DnsName,
         kind: DnsRecordKind,
     ) -> Result<()>;
 }
@@ -79,7 +79,7 @@ impl<T: DnsPort + ?Sized> DnsPort for Arc<T> {
     async fn delete_record(
         &self,
         domain: &Domain,
-        name: &Subdomain,
+        name: &DnsName,
         kind: DnsRecordKind,
     ) -> Result<()> {
         (**self).delete_record(domain, name, kind).await
@@ -120,7 +120,7 @@ impl<T: SecretPort + ?Sized> SecretPort for Arc<T> {
 #[async_trait]
 pub trait ProcessPort: Send + Sync {
     /// Run a one-shot subprocess to completion. Used for `caddy reload`,
-    /// `passveil show`, and similar short-lived calls.
+    /// `rageveil show`, and similar short-lived calls.
     async fn run_to_completion(&self, spec: &ProcessSpec) -> Result<ProcessExit>;
 }
 

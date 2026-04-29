@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 use tuntun_core::{
-    DnsRecord, DnsRecordContent, DnsRecordId, DnsRecordKind, Domain, Fqdn, HttpResponse, Subdomain,
+    DnsName, DnsRecord, DnsRecordContent, DnsRecordId, DnsRecordKind, Domain, Fqdn, HttpResponse,
     Ttl,
 };
 
@@ -87,15 +87,13 @@ fn record_from_raw(apex: &Domain, raw: &RawRecord) -> Result<Option<DnsRecord>, 
         .map_err(|e| DnsError::invalid_field("id", e.to_string()))?;
 
     let kind = parse_kind(&raw.kind)?;
-    // Porkbun also returns root records (where `name` equals the apex) and
-    // multi-label subdomains. We currently only model single-label subdomains
-    // because that is what tuntun reconciles. Skip anything else so callers
-    // get a clean view of just the records they are about to upsert.
-    let bare = bare_subdomain(&raw.name, apex);
-    let Some(bare) = bare else {
+    // Porkbun records that name the apex itself (e.g. `memorici.de`) are not
+    // subdomain records — skip them. Everything else (single-label, multi-
+    // label, wildcard) survives as a [`DnsName`].
+    let Some(bare) = bare_name(&raw.name, apex) else {
         return Ok(None);
     };
-    let name = Subdomain::new(bare)
+    let name = DnsName::new(bare)
         .map_err(|e| DnsError::invalid_field("name", e.to_string()))?;
 
     let ttl_u32 = parse_ttl(&raw.ttl)?;
@@ -163,19 +161,19 @@ fn parse_content(kind: DnsRecordKind, content: &str) -> Result<DnsRecordContent,
     }
 }
 
-/// Compute the bare subdomain label, given Porkbun's `name` field plus our
-/// known apex. Returns `None` if `name` denotes the apex itself or contains
-/// multiple labels (e.g. `foo.bar.example.com` has bare `foo.bar` which is
-/// not a single DNS label and not modelled in `tuntun_core`'s `Subdomain`).
+/// Compute the bare DNS-name fragment relative to `apex`, given Porkbun's
+/// `name` field. Returns `None` if `name` denotes the apex itself.
 ///
 /// Porkbun's `name` is sometimes the bare label (`"blog"`), sometimes the
-/// full FQDN (`"blog.example.com"`). Both are accepted.
-fn bare_subdomain(name: &str, apex: &Domain) -> Option<String> {
+/// full FQDN (`"blog.example.com"`), and sometimes a multi-label subdomain
+/// (`"*.sweater.example.com"`). All are accepted; the value returned is the
+/// portion to the *left* of the apex.
+fn bare_name(name: &str, apex: &Domain) -> Option<String> {
     let apex_str = apex.as_str();
-    let candidate: &str = if name == apex_str {
-        // root record — not a subdomain
+    if name == apex_str {
         return None;
-    } else if let Some(stripped) = name
+    }
+    let candidate: &str = if let Some(stripped) = name
         .strip_suffix(apex_str)
         .and_then(|s| s.strip_suffix('.'))
     {
@@ -183,7 +181,7 @@ fn bare_subdomain(name: &str, apex: &Domain) -> Option<String> {
     } else {
         name
     };
-    if candidate.is_empty() || candidate.contains('.') {
+    if candidate.is_empty() {
         return None;
     }
     Some(candidate.to_string())
@@ -321,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_skips_multi_label() {
+    fn parse_list_keeps_multi_label() {
         let resp = http_ok(&json!({
             "status": "SUCCESS",
             "records": [
@@ -335,7 +333,27 @@ mod tests {
             ]
         }));
         let recs = parse_list_response(&resp, &apex()).unwrap();
-        assert!(recs.is_empty());
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name.as_str(), "foo.bar");
+    }
+
+    #[test]
+    fn parse_list_keeps_wildcard() {
+        let resp = http_ok(&json!({
+            "status": "SUCCESS",
+            "records": [
+                {
+                    "id": "2",
+                    "name": "*.sweater.memorici.de",
+                    "type": "A",
+                    "content": "1.2.3.4",
+                    "ttl": "60"
+                }
+            ]
+        }));
+        let recs = parse_list_response(&resp, &apex()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name.as_str(), "*.sweater");
     }
 
     #[test]

@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use tuntun_core::{
-    DnsPort, DnsRecord, DnsRecordId, DnsRecordKind, DnsRecordSpec, Domain, HttpPort, Result,
-    Subdomain,
+    DnsName, DnsPort, DnsRecord, DnsRecordId, DnsRecordKind, DnsRecordSpec, Domain, HttpPort,
+    Result,
 };
 
 use super::creds::PorkbunCreds;
@@ -79,7 +79,7 @@ impl<H: HttpPort> DnsPort for PorkbunDns<H> {
     async fn delete_record(
         &self,
         domain: &Domain,
-        name: &Subdomain,
+        name: &DnsName,
         kind: DnsRecordKind,
     ) -> Result<()> {
         let req = build_delete_request(&self.creds, domain, name, kind)?;
@@ -97,7 +97,7 @@ impl<H: HttpPort> PorkbunDns<H> {
     pub async fn list_records_for(
         &self,
         domain: &Domain,
-        name: &Subdomain,
+        name: &DnsName,
         kind: DnsRecordKind,
     ) -> Result<Vec<DnsRecord>> {
         let req = build_list_request(&self.creds, domain, name, kind)?;

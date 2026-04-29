@@ -19,6 +19,7 @@ use crate::dns_reconciler::Reconciler;
 use crate::registry::Registry;
 use crate::tls::load_or_generate;
 use crate::tunnel::acceptor::Acceptor;
+use crate::tunnel::bastion;
 
 pub async fn run(config: Option<&Path>) -> Result<()> {
     let cfg = Arc::new(ServerConfig::load(config).await?);
@@ -48,27 +49,58 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     let tls_material = load_or_generate(&cfg).await?;
     let tls_handle = Arc::new(tls_material.into_acceptor()?);
 
-    // Load (or generate) the server's session-token signing key.
-    let signing_key = Arc::new(load_or_generate_signing_key(&cfg).await?);
+    // Load the server's session-token signing key. The path comes from a
+    // systemd LoadCredential, materialized into ${CREDENTIALS_DIRECTORY}/
+    // server-signing-key. We refuse to start without it — silently
+    // auto-generating would invalidate every issued session on every restart
+    // that lost the file, which is the kind of thing you'd rather find out
+    // about loudly.
+    let signing_key = Arc::new(load_signing_key(&secrets).await?);
 
     // Boot Caddy.
     supervisor.launch().await?;
 
-    // Auth endpoint (axum).
+    // Auth endpoint (axum). The same router handles both `/verify` (called
+    // by Caddy's `forward_auth` from the inside) and `/login` / `/logout`
+    // (proxied through Caddy from the per-tenant `auth.<tenant>.<domain>`
+    // sites). We bind both `auth_listen` and `login_listen` so the same
+    // routes are reachable on either port — the upstreams in the Caddyfile
+    // point at the right one for each role.
     let auth_state = Arc::new(AuthState::new(cfg.clone(), signing_key));
     let auth_listen = cfg.auth_listen.clone();
-    let auth_state_for_serve = auth_state.clone();
+    let login_listen = cfg.login_listen.clone();
+    let auth_state_a = auth_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::auth_endpoint::serve(&auth_listen, auth_state_for_serve).await {
-            tracing::error!("auth endpoint: {e:#}");
+        if let Err(e) = crate::auth_endpoint::serve(&auth_listen, auth_state_a).await {
+            tracing::error!("auth endpoint (auth_listen): {e:#}");
         }
     });
+    if login_listen != cfg.auth_listen {
+        let auth_state_b = auth_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::auth_endpoint::serve(&login_listen, auth_state_b).await {
+                tracing::error!("auth endpoint (login_listen): {e:#}");
+            }
+        });
+    }
 
     // DNS reconciler.
     let reconciler = Arc::new(Reconciler::new(cfg.clone(), registry.clone(), dns));
     tokio::spawn(async move {
         if let Err(e) = reconciler.run_forever().await {
             tracing::error!("dns reconciler: {e:#}");
+        }
+    });
+
+    // SSH bastion side-car. The bastion sshd's `ForceCommand` helper
+    // (`tuntun-server tcp-forward <tenant>`) connects to this unix socket;
+    // the listener routes the connection to the right tenant's tunnel via
+    // the registry and a [`StreamOpenBuiltinFrame`].
+    let bastion_socket = cfg.bastion_socket.clone();
+    let bastion_registry = registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bastion::run_listener(bastion_socket, bastion_registry).await {
+            tracing::error!("ssh bastion: {e:#}");
         }
     });
 
@@ -82,35 +114,15 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     acceptor.run().await
 }
 
-async fn load_or_generate_signing_key(cfg: &ServerConfig) -> Result<SigningKey> {
-    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-    use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+async fn load_signing_key(secrets: &CredentialDirSecrets) -> Result<SigningKey> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
 
-    let path = cfg.state_dir.join("server-signing-key.pem");
-    if let Ok(bytes) = tokio::fs::read(&path).await {
-        let pem =
-            std::str::from_utf8(&bytes).context("server-signing-key.pem is not utf-8")?;
-        let sk = SigningKey::from_pkcs8_pem(pem)
-            .map_err(|e| anyhow::anyhow!("parse signing key: {e}"))?;
-        tracing::info!("loaded server signing key from {}", path.display());
-        return Ok(sk);
-    }
-
-    tokio::fs::create_dir_all(&cfg.state_dir)
+    let key = SecretKey::new("server-signing-key").context("invalid secret key")?;
+    let value = secrets
+        .load(&key)
         .await
-        .with_context(|| format!("mkdir {}", cfg.state_dir.display()))?;
-
-    let mut csprng = rand::rngs::OsRng;
-    let sk = SigningKey::generate(&mut csprng);
-    let pem = sk
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("encode signing key as PKCS8 PEM: {e}"))?;
-    tokio::fs::write(&path, pem.as_bytes())
-        .await
-        .with_context(|| format!("write {}", path.display()))?;
-    tracing::warn!(
-        "generated new server signing key at {} (back this up)",
-        path.display()
-    );
-    Ok(sk)
+        .context("load server-signing-key from systemd CREDENTIALS_DIRECTORY (configure services.tuntun-server.serverSigningKeyFile)")?;
+    let pem = std::str::from_utf8(value.expose_bytes())
+        .context("server-signing-key is not utf-8 PEM")?;
+    SigningKey::from_pkcs8_pem(pem).map_err(|e| anyhow::anyhow!("parse signing key: {e}"))
 }

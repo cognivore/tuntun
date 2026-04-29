@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 
 use tuntun_core::{
-    DnsPort, DnsRecord, DnsRecordContent, DnsRecordSpec, Domain, HttpPort, Subdomain, Ttl,
+    DnsName, DnsPort, DnsRecord, DnsRecordContent, DnsRecordSpec, Domain, HttpPort, Ttl,
 };
 use tuntun_dns::PorkbunDns;
 
@@ -55,23 +55,35 @@ impl<H: HttpPort + 'static> Reconciler<H> {
         let ip = Ipv4Addr::from_str(&self.config.public_ip)
             .map_err(|e| anyhow!("public_ip {}: {e}", self.config.public_ip))?;
 
-        let services = self.registry.snapshot_services().await;
-        let mut out = Vec::with_capacity(services.len() + 1);
+        // Per-tenant wildcard: every tenant configured on this server gets a
+        // `*.<tenant>.<domain>` A record. This covers all current and future
+        // services they declare (Caddy resolves each specific hostname via
+        // HTTP-01 against the wildcard) plus the bastion `ssh.<tenant>` entry.
+        // We read tenants from the configured tenants_file rather than from
+        // the live registry so DNS reconciles even when no client is currently
+        // connected — that's important for ACME and for first connections.
+        let tenants = self
+            .config
+            .load_tenants()
+            .await
+            .map_err(|e| anyhow!("load tenants for dns reconcile: {e:#}"))?;
 
-        if let Ok(wildcard) = Subdomain::new("*") {
+        let mut out = Vec::with_capacity(tenants.0.len() + 1);
+
+        // Apex login site — keeps `auth.<domain>` reachable for the shared
+        // login flow.
+        if let Ok(name) = DnsName::new("auth") {
             out.push(DnsRecordSpec {
                 apex: domain.clone(),
-                name: wildcard,
+                name,
                 ttl,
                 content: DnsRecordContent::A { ip },
             });
         }
 
-        for svc in services {
-            let fqdn_str = svc.fqdn.as_str();
-            let Some(idx) = fqdn_str.find('.') else { continue };
-            let label = &fqdn_str[..idx];
-            if let Ok(name) = Subdomain::new(label.to_string()) {
+        for tenant in tenants.0.keys() {
+            let wildcard = format!("*.{tenant}");
+            if let Ok(name) = DnsName::new(wildcard) {
                 out.push(DnsRecordSpec {
                     apex: domain.clone(),
                     name,

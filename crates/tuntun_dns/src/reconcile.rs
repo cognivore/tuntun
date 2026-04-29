@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tuntun_core::{DnsRecord, DnsRecordKind, DnsRecordSpec, Domain, Subdomain};
+use tuntun_core::{DnsName, DnsRecord, DnsRecordKind, DnsRecordSpec, Domain};
 
 /// One step in a reconciliation plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum DnsAction {
     /// Record exists on the provider but is not in the desired set — delete it.
     Delete {
         domain: Domain,
-        name: Subdomain,
+        name: DnsName,
         kind: DnsRecordKind,
     },
     /// Record already matches the spec; nothing to do. Emitted so callers can
@@ -52,7 +52,7 @@ pub fn plan_dns_reconciliation(
     desired: &[DnsRecordSpec],
     observed: &[DnsRecord],
 ) -> Vec<DnsAction> {
-    type Key = (Domain, Subdomain, DnsRecordKind);
+    type Key = (Domain, DnsName, DnsRecordKind);
 
     fn record_key(rec: &DnsRecord) -> Key {
         (rec.apex.clone(), rec.name.clone(), rec.content.kind())
@@ -108,7 +108,7 @@ mod tests {
     fn spec_a(name: &str, ip: [u8; 4], ttl: u32) -> DnsRecordSpec {
         DnsRecordSpec {
             apex: apex(),
-            name: Subdomain::new(name).unwrap(),
+            name: DnsName::new(name).unwrap(),
             ttl: Ttl::new(ttl).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
@@ -120,7 +120,7 @@ mod tests {
         DnsRecord {
             id: DnsRecordId::new(id).unwrap(),
             apex: apex(),
-            name: Subdomain::new(name).unwrap(),
+            name: DnsName::new(name).unwrap(),
             ttl: Ttl::new(ttl).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
@@ -174,7 +174,7 @@ mod tests {
             plan,
             vec![DnsAction::Delete {
                 domain: apex(),
-                name: Subdomain::new("stale").unwrap(),
+                name: DnsName::new("stale").unwrap(),
                 kind: DnsRecordKind::A,
             }]
         );
@@ -187,7 +187,7 @@ mod tests {
             spec_a("api", [1, 2, 3, 4], 60),
             DnsRecordSpec {
                 apex: apex(),
-                name: Subdomain::new("api").unwrap(),
+                name: DnsName::new("api").unwrap(),
                 ttl: Ttl::new(60).unwrap(),
                 content: DnsRecordContent::Cname {
                     target: Fqdn::new("edge.memorici.de").unwrap(),

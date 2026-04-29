@@ -28,6 +28,10 @@ pub struct DaemonConfig {
     /// the GitHub repo URL.
     #[serde(default = "default_tuntun_flake_ref")]
     pub tuntun_flake_ref: String,
+    /// Local TCP port the laptop's `sshd` listens on. The reverse-SSH bastion
+    /// pipes inbound bastion connections here. Default 22.
+    #[serde(default = "default_ssh_local_port")]
+    pub ssh_local_port: u16,
 }
 
 fn default_private_key_secret_name() -> String {
@@ -36,6 +40,10 @@ fn default_private_key_secret_name() -> String {
 
 fn default_tuntun_flake_ref() -> String {
     "github:cognivore/tuntun".to_string()
+}
+
+fn default_ssh_local_port() -> u16 {
+    22
 }
 
 impl DaemonConfig {
@@ -101,5 +109,11 @@ fn parse_minimal_toml(bytes: &[u8]) -> Result<DaemonConfig> {
             .get("tuntun_flake_ref")
             .cloned()
             .unwrap_or_else(default_tuntun_flake_ref),
+        ssh_local_port: map
+            .get("ssh_local_port")
+            .map(|s| s.parse::<u16>())
+            .transpose()
+            .map_err(|e| anyhow!("ssh_local_port: {e}"))?
+            .unwrap_or_else(default_ssh_local_port),
     })
 }

@@ -22,13 +22,14 @@ use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode};
 
@@ -51,7 +52,8 @@ use crate::config::{ServerConfig, TenantsFileEntry};
 use crate::registry::{ClientRecord, ProjectRecord, Registry, ServiceRecord};
 use crate::tls::TlsAcceptorHandle;
 use crate::tunnel::per_service_listener::{
-    build_stream_open, pump_stream, run_listener, OpenStreamRequest,
+    build_stream_open, build_stream_open_builtin, pump_stream, run_listener, OpenStreamRequest,
+    OpenStreamSubject,
 };
 
 const SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -71,17 +73,93 @@ pub async fn handle_connection(
         .await
         .with_context(|| format!("tls accept from {peer}"))?;
 
-    // 2. Yamux server connection. Wrap the tokio TLS stream so it implements
-    // futures-io.
+    // 2. Yamux server connection. We give exclusive ownership to a single
+    // driver task that interleaves three things in one `poll_fn`:
+    //   - polling for inbound streams (drives the connection),
+    //   - polling for `OpenOutbound` requests on a channel (lets the
+    //     `stream_opener` ask for new outbound streams without contending
+    //     for a lock),
+    //   - polling for `poll_new_outbound` itself when an open is in flight.
+    // Wrapping the connection in `Arc<Mutex>` deadlocks: the lock must be
+    // held while awaiting an inbound, but that blocks anyone wanting to
+    // open an outbound. Single-owner + a command channel sidesteps that.
     let mut yamux_conn =
         YamuxConnection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Server);
 
-    // 3. The first inbound stream is the control stream.
-    let control_stream = poll_fn(|cx| std::pin::Pin::new(&mut yamux_conn).poll_next_inbound(cx))
-        .await
-        .ok_or_else(|| anyhow!("client closed before opening control stream"))?
-        .map_err(|e| anyhow!("yamux control stream accept: {e}"))?;
+    // 3. The first inbound stream is the control stream. We poll it once
+    // here so the rest of the session can read/write on it — and *then*
+    // move the Connection into the driver task.
+    let control_stream =
+        poll_fn(|cx| std::pin::Pin::new(&mut yamux_conn).poll_next_inbound(cx))
+            .await
+            .ok_or_else(|| anyhow!("client closed before opening control stream"))?
+            .map_err(|e| anyhow!("yamux control stream accept: {e}"))?;
     let mut control = control_stream.compat();
+
+    // Channel into the driver: stream_opener tasks send `OpenOutboundCmd`
+    // and receive a freshly-allocated yamux Stream back via a oneshot.
+    let (open_tx, mut open_rx) = mpsc::channel::<OpenOutboundCmd>(64);
+
+    let driver = tokio::spawn(async move {
+        let mut conn = yamux_conn;
+        // Yamux 0.13 only flushes queued outbound writes when the Connection
+        // is polled. With nothing else poking it, control-stream frames
+        // (e.g., StreamOpen) and freshly-pumped service bytes sit on the
+        // queue until the next inbound event arrives — easily 30s in idle
+        // HTTP flows. A 10 ms tick keeps the driver in motion so writes
+        // flush within a frame's RTT.
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // poll_fn lets us poll the open-command channel, a tick, and the
+            // inbound-stream side using the same `&mut conn`, in sequence
+            // within a single closure call. Whichever is ready first wins.
+            let event: DriverEvent = poll_fn(|cx| {
+                if let Poll::Ready(req_opt) = open_rx.poll_recv(cx) {
+                    return Poll::Ready(DriverEvent::OpenCmd(req_opt));
+                }
+                if tick.poll_tick(cx).is_ready() {
+                    return Poll::Ready(DriverEvent::Tick);
+                }
+                match std::pin::Pin::new(&mut conn).poll_next_inbound(cx) {
+                    Poll::Ready(r) => Poll::Ready(DriverEvent::Inbound(r)),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            match event {
+                // Both `OpenCmd(None)` (the channel closed because the
+                // session is tearing down) and `Inbound(None)` (yamux saw
+                // EOF) mean the same thing: stop driving.
+                DriverEvent::OpenCmd(None) | DriverEvent::Inbound(None) => break,
+                DriverEvent::OpenCmd(Some(cmd)) => {
+                    let res = poll_fn(|cx| {
+                        std::pin::Pin::new(&mut conn).poll_new_outbound(cx)
+                    })
+                    .await;
+                    let _ = cmd.reply.send(
+                        res.map_err(|e| anyhow!("yamux open_outbound: {e}")),
+                    );
+                }
+                DriverEvent::Tick => {
+                    // Loop body exists purely so the next iteration's
+                    // poll_next_inbound runs, which drives the connection's
+                    // I/O state machine and flushes any queued writes.
+                }
+                DriverEvent::Inbound(Some(Ok(stream))) => {
+                    tracing::debug!(
+                        "ignoring extra inbound yamux stream id={}",
+                        stream.id()
+                    );
+                    drop(stream);
+                }
+                DriverEvent::Inbound(Some(Err(e))) => {
+                    tracing::debug!("yamux driver: inbound error: {e}");
+                    break;
+                }
+            }
+        }
+    });
 
     // 4. Receive Hello.
     let hello = read_one_frame(&mut control).await?;
@@ -153,7 +231,15 @@ pub async fn handle_connection(
         let mut svc_records: BTreeMap<ServiceName, ServiceRecord> = BTreeMap::new();
         for svc in &proj.services {
             let port: ServicePort = registry.allocate_port().await;
-            let fqdn_str = format!("{}.{}", svc.subdomain.as_str(), config.domain);
+            // Schema: <subdomain>.<tenant>.<domain> — the tenant is part of
+            // the public hostname, so two tenants on the same server can each
+            // declare a service called "blog" without conflict.
+            let fqdn_str = format!(
+                "{}.{}.{}",
+                svc.subdomain.as_str(),
+                tenant.as_str(),
+                config.domain
+            );
             let fqdn = Fqdn::new(fqdn_str.clone())
                 .map_err(|e| anyhow!("derive fqdn {fqdn_str}: {e}"))?;
 
@@ -188,10 +274,16 @@ pub async fn handle_connection(
     // to the client sends it here; the writer task drains it.
     let (control_tx, control_rx) = mpsc::channel::<ControlFrame>(64);
 
+    // Stream-open requests channel — used both by the per-service public TCP
+    // listeners spawned below and by the global SSH bastion side-car (via
+    // [`ClientRecord::stream_tx`] looked up by tenant).
+    let (stream_tx, stream_rx) = mpsc::channel::<OpenStreamRequest>(64);
+
     let client_record = ClientRecord {
         client_id: client_id.clone(),
         tenant: tenant.clone(),
         control_tx: control_tx.clone(),
+        stream_tx: stream_tx.clone(),
         projects: projects.clone(),
     };
     registry.upsert_client(client_record).await;
@@ -209,7 +301,6 @@ pub async fn handle_connection(
     }
 
     // 8. Spin up one public listener per service.
-    let (stream_tx, stream_rx) = mpsc::channel::<OpenStreamRequest>(64);
     for proj in projects.values() {
         for svc in proj.services.values() {
             let pid = proj.project.clone();
@@ -223,37 +314,17 @@ pub async fn handle_connection(
             });
         }
     }
-    drop(stream_tx); // listeners hold the only senders
+    // The session keeps a clone of `stream_tx` alive (via the registry) so the
+    // SSH bastion can dispatch builtin requests after the per-service
+    // listeners have exited. Drop the local handle so the channel closes when
+    // both the listeners *and* the registry entry are gone.
+    drop(stream_tx);
 
-    let yamux_arc = Arc::new(Mutex::new(yamux_conn));
-
-    // 9. Inbound-stream driver: drain unexpected client-initiated streams to
-    // keep the yamux state machine progressing. Returns when the connection
-    // shuts down.
-    let driver_yamux = yamux_arc.clone();
-    let driver = tokio::spawn(async move {
-        loop {
-            let mut conn = driver_yamux.lock().await;
-            let res = poll_fn(|cx| std::pin::Pin::new(&mut *conn).poll_next_inbound(cx)).await;
-            drop(conn);
-            match res {
-                None => break,
-                Some(Ok(stream)) => {
-                    tracing::debug!("ignoring extra inbound yamux stream id={}", stream.id());
-                    drop(stream);
-                }
-                Some(Err(e)) => {
-                    tracing::debug!("yamux driver: inbound error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // 10. Stream-opener loop: for each public connection, open an outbound
-    // yamux stream, send a StreamOpen control frame, and pump bytes.
+    // 10. Stream-opener loop: for each public connection, ask the driver
+    // (via the open_tx channel) to allocate an outbound yamux stream, send
+    // a StreamOpen control frame, and pump bytes.
     let opener = tokio::spawn(stream_opener(
-        yamux_arc.clone(),
+        open_tx.clone(),
         stream_rx,
         control_tx.clone(),
     ));
@@ -276,47 +347,79 @@ pub async fn handle_connection(
     Ok(())
 }
 
+/// Driver event surfaced by the single `poll_fn` inside the driver task.
+enum DriverEvent {
+    /// An open-outbound command from the stream_opener task (or the channel
+    /// closed, in which case the inner Option is `None`).
+    OpenCmd(Option<OpenOutboundCmd>),
+    /// Periodic tick — forces another iteration so the connection is polled
+    /// and any queued outbound writes get flushed.
+    Tick,
+    /// Yamux yielded an inbound stream (or the connection ended).
+    Inbound(Option<Result<yamux::Stream, yamux::ConnectionError>>),
+}
+
+/// Request from the stream-opener task to the driver: please allocate a
+/// new outbound yamux stream and send it back.
+struct OpenOutboundCmd {
+    reply: oneshot::Sender<Result<yamux::Stream>>,
+}
+
 async fn stream_opener(
-    yamux_arc: Arc<Mutex<YamuxConnection<tokio_util::compat::Compat<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>>>,
+    open_tx: mpsc::Sender<OpenOutboundCmd>,
     mut stream_rx: mpsc::Receiver<OpenStreamRequest>,
     control_tx: mpsc::Sender<ControlFrame>,
 ) {
     while let Some(req) = stream_rx.recv().await {
-        let mut conn = yamux_arc.lock().await;
-        let outbound = match poll_fn(|cx| {
-            std::pin::Pin::new(&mut *conn).poll_new_outbound(cx)
-        })
-        .await
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if open_tx
+            .send(OpenOutboundCmd { reply: reply_tx })
+            .await
+            .is_err()
         {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = req.ack.send(Err(anyhow!("yamux open_outbound: {e}")));
+            let _ = req.ack.send(Err(anyhow!("yamux driver gone")));
+            continue;
+        }
+        let outbound = match reply_rx.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let _ = req.ack.send(Err(e));
+                continue;
+            }
+            Err(_) => {
+                let _ = req.ack.send(Err(anyhow!("yamux driver dropped reply")));
                 continue;
             }
         };
         let stream_id = outbound.id().val();
-        drop(conn);
 
-        let frame = build_stream_open(stream_id, &req.project, &req.service);
+        let (frame, log_label) = match &req.subject {
+            OpenStreamSubject::Service { project, service } => (
+                build_stream_open(stream_id, project, service),
+                format!("{project}/{service}"),
+            ),
+            OpenStreamSubject::Builtin(kind) => (
+                build_stream_open_builtin(stream_id, *kind),
+                format!("builtin:{kind:?}"),
+            ),
+        };
         if control_tx.send(frame).await.is_err() {
             let _ = req.ack.send(Err(anyhow!("control channel closed")));
             continue;
         }
 
-        let svc_for_log = req.service.clone();
-        let proj_for_log = req.project.clone();
         let ack = req.ack;
-        let tcp = req.tcp;
+        let inbound = req.inbound;
         tokio::spawn(async move {
-            match pump_stream(outbound, tcp).await {
+            match pump_stream(outbound, inbound).await {
                 Ok((up, down)) => {
                     tracing::debug!(
-                        "stream {proj_for_log}/{svc_for_log} closed; up={up} down={down}"
+                        "stream {log_label} closed; up={up} down={down}"
                     );
                     let _ = ack.send(Ok(()));
                 }
                 Err(e) => {
-                    tracing::debug!("stream {proj_for_log}/{svc_for_log} pump: {e}");
+                    tracing::debug!("stream {log_label} pump: {e}");
                     let _ = ack.send(Err(anyhow!("pump: {e}")));
                 }
             }
@@ -452,7 +555,6 @@ async fn render_and_reload_caddy(
         let auth = match svc.auth_policy {
             ProtoAuthPolicy::Tenant => CaddyAuthPolicy::Tenant,
             ProtoAuthPolicy::Public => CaddyAuthPolicy::Public,
-            ProtoAuthPolicy::None => CaddyAuthPolicy::None,
         };
         let health_path = svc.health_check.as_ref().map(|h| h.path.clone());
         sites.push(ServiceSite {
@@ -463,8 +565,28 @@ async fn render_and_reload_caddy(
         });
     }
 
-    let login_fqdn = Fqdn::new(format!("auth.{}", cfg.domain))
-        .map_err(|e| anyhow!("derive login fqdn: {e}"))?;
+    // One login site per configured tenant, served at
+    // `auth.<tenant>.<domain>`. The upstream is shared (a single internal
+    // HTTP service that reads `Host` to figure out which tenant the request
+    // belongs to) — this matches the per-tenant cookie scope (`Domain=
+    // .<tenant>.<domain>`), which a single apex `auth.<domain>` could not
+    // produce because browsers reject Set-Cookie attempting to scope to a
+    // domain that is not a parent of the request URL.
+    let tenants = cfg
+        .load_tenants()
+        .await
+        .map_err(|e| anyhow!("load tenants for caddy render: {e:#}"))?;
+    let mut login_sites: Vec<LoginSiteConfig> = Vec::with_capacity(tenants.0.len());
+    for tenant_name in tenants.0.keys() {
+        let fqdn_str = format!("auth.{tenant_name}.{}", cfg.domain);
+        let fqdn = Fqdn::new(fqdn_str.clone())
+            .map_err(|e| anyhow!("derive login fqdn {fqdn_str}: {e}"))?;
+        login_sites.push(LoginSiteConfig {
+            fqdn,
+            upstream: cfg.login_listen.clone(),
+        });
+    }
+
     let input = CaddyInput {
         global: GlobalConfig {
             admin_listen: cfg.caddy_admin.clone(),
@@ -474,10 +596,7 @@ async fn render_and_reload_caddy(
         auth_endpoint: AuthEndpointConfig {
             upstream: cfg.auth_listen.clone(),
         },
-        login_site: LoginSiteConfig {
-            fqdn: login_fqdn,
-            upstream: cfg.login_listen.clone(),
-        },
+        login_sites,
         services: sites,
     };
     supervisor.render_and_reload(&input).await

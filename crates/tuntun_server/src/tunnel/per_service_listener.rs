@@ -1,37 +1,59 @@
-//! Per-service public TCP listener.
+//! Per-service public TCP listener and shared open-stream plumbing.
 //!
-//! Each registered service has a server-side port that Caddy proxies public
-//! traffic to. When a TCP connection arrives on that port, this task asks the
-//! owning tunnel session to allocate a fresh yamux outbound stream, sends a
-//! `StreamOpen` control frame so the client knows which service the stream
-//! belongs to, and bidirectionally pipes bytes between the public TCP socket
-//! and the yamux stream.
+//! Each registered tenant-declared service has a server-side TCP port that
+//! Caddy proxies public traffic to. When a TCP connection arrives, the
+//! listener task asks the owning tunnel session (via [`OpenStreamRequest`])
+//! to allocate a fresh yamux outbound stream, send the matching control
+//! frame, and pipe bytes between the public connection and the yamux stream.
+//!
+//! The same machinery is also used by the SSH bastion side-car: an inbound
+//! unix-socket connection from the bastion `ForceCommand` is wrapped as an
+//! [`OpenStreamRequest`] with [`OpenStreamSubject::Builtin`] and dispatched
+//! through the same per-session opener task. That keeps yamux ownership
+//! local to the session.
 
 use std::io;
 use std::net::SocketAddr;
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use yamux::Stream as YamuxStream;
 
 use tuntun_core::{ProjectId, ServiceName, ServicePort};
-use tuntun_proto::{ControlFrame, StreamOpenFrame};
+use tuntun_proto::{BuiltinService, ControlFrame, StreamOpenBuiltinFrame, StreamOpenFrame};
 
-/// Request sent to the session's stream-opener task to create a new outbound
-/// yamux stream and forward bytes over it.
+/// Trait alias for "a bidirectional byte stream we can pump through a yamux
+/// stream". Implemented automatically for `tokio::net::TcpStream`,
+/// `tokio::net::UnixStream`, and any other duplex transport.
+pub(crate) trait DuplexStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> DuplexStream for T {}
+
+/// Which kind of yamux stream the requester wants opened.
+pub(crate) enum OpenStreamSubject {
+    /// A tenant-declared service registered via `tuntun.nix`.
+    Service {
+        project: ProjectId,
+        service: ServiceName,
+    },
+    /// A server-managed side-car (e.g., the SSH bastion).
+    Builtin(BuiltinService),
+}
+
+/// Request sent to a session's stream-opener task to create a new outbound
+/// yamux stream and pipe bytes between an inbound transport and that stream.
 pub(crate) struct OpenStreamRequest {
-    pub project: ProjectId,
-    pub service: ServiceName,
-    pub tcp: tokio::net::TcpStream,
-    /// Replier — we tell the listener whether the stream open ultimately
+    pub subject: OpenStreamSubject,
+    pub inbound: Box<dyn DuplexStream>,
+    /// Replier — we tell the requester whether the stream open ultimately
     /// succeeded so it can log meaningfully.
     pub ack: oneshot::Sender<Result<()>>,
 }
 
-/// Run the per-service listener. The listener exits when `tx` is closed (i.e.
-/// the owning session has dropped).
+/// Run the per-service public TCP listener. The listener exits when `tx` is
+/// closed (i.e., the owning session has dropped).
 pub async fn run_listener(
     project: ProjectId,
     service: ServiceName,
@@ -61,9 +83,11 @@ pub async fn run_listener(
 
         let (ack_tx, ack_rx) = oneshot::channel();
         let request = OpenStreamRequest {
-            project: project.clone(),
-            service: service.clone(),
-            tcp: sock,
+            subject: OpenStreamSubject::Service {
+                project: project.clone(),
+                service: service.clone(),
+            },
+            inbound: Box::new(sock),
             ack: ack_tx,
         };
         if tx.send(request).await.is_err() {
@@ -87,18 +111,20 @@ pub async fn run_listener(
     }
 }
 
-/// Pump bytes between a yamux stream and a TCP connection. Used by the
-/// session task once the control-plane `StreamOpen` frame has been emitted.
-pub(crate) async fn pump_stream(
+/// Pump bytes between a yamux stream and an inbound duplex transport. Used by
+/// the session task once the matching control frame has been emitted.
+pub(crate) async fn pump_stream<S>(
     yamux_stream: YamuxStream,
-    tcp: tokio::net::TcpStream,
-) -> io::Result<(u64, u64)> {
+    mut inbound: S,
+) -> io::Result<(u64, u64)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut yamux = yamux_stream.compat();
-    let mut tcp = tcp;
-    tokio::io::copy_bidirectional(&mut yamux, &mut tcp).await
+    tokio::io::copy_bidirectional(&mut yamux, &mut inbound).await
 }
 
-/// Helper: build a StreamOpenFrame from the components.
+/// Helper: build a [`StreamOpenFrame`] for a tenant-declared service stream.
 pub(crate) fn build_stream_open(
     stream_id: u32,
     project: &ProjectId,
@@ -109,4 +135,12 @@ pub(crate) fn build_stream_open(
         project: project.clone(),
         service: service.clone(),
     })
+}
+
+/// Helper: build a [`StreamOpenBuiltinFrame`] for a side-car stream.
+pub(crate) fn build_stream_open_builtin(
+    stream_id: u32,
+    kind: BuiltinService,
+) -> ControlFrame {
+    ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame { stream_id, kind })
 }

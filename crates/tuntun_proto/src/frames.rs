@@ -65,6 +65,13 @@ pub enum ControlFrame {
 
     /// Either direction. A protocol-level error report.
     Error(ErrorFrame),
+
+    /// Server -> Client. A new connection arrived for a built-in side-car
+    /// service that is not declared in `tuntun.nix` (currently: the SSH
+    /// bastion). The client should open a yamux stream with the provided id
+    /// and pipe it to the appropriate local socket (e.g., `127.0.0.1:22` for
+    /// [`BuiltinService::Ssh`]).
+    StreamOpenBuiltin(StreamOpenBuiltinFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -147,11 +154,10 @@ pub struct AuthResultFrame {
 pub enum AuthPolicy {
     /// Only members of the owning tenant may reach the service.
     Tenant,
-    /// Anyone on the public internet may reach the service.
+    /// Anyone on the public internet may reach the service. The tunnel
+    /// performs no auth check; the service is responsible for any auth it
+    /// cares about (e.g. its own OAuth login screen).
     Public,
-    /// No authentication enforced at the tunnel layer (the service handles
-    /// its own auth, e.g. a public-facing OAuth login screen).
-    None,
 }
 
 /// Optional health-check description for a registered service.
@@ -317,4 +323,31 @@ pub struct ErrorFrame {
     pub code: ErrorCode,
     /// Free-form human-readable explanation.
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Built-in side-car services
+// ---------------------------------------------------------------------------
+
+/// Server-managed services that are *not* declared in the user's
+/// `tuntun.nix`, and therefore cannot be addressed via the regular
+/// `(project, service)` pair carried by [`StreamOpenFrame`].
+///
+/// **Wire stability**: variant order is part of the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuiltinService {
+    /// Reverse-SSH bastion. The client should pipe the stream to its local
+    /// `sshd` (typically `127.0.0.1:22`).
+    Ssh,
+}
+
+/// Server -> Client: a new public connection arrived for a built-in side-car
+/// service. The client opens an inbound yamux stream with `stream_id` and
+/// forwards it to the local socket implied by `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamOpenBuiltinFrame {
+    /// Yamux-layer stream identifier the client should use.
+    pub stream_id: u32,
+    /// Which built-in service the stream is for.
+    pub kind: BuiltinService,
 }

@@ -11,19 +11,25 @@ your own NixOS box, gated by a per-tenant password.
 # tuntun.nix
 { tuntun, ... }:
 tuntun.mkProject {
-  tenant = "memorici-de";
-  domain = "memorici.de";
+  tenant = "sweater";
+  domain = "trolltech.art";
   services = {
-    blog.subdomain = "blog";  blog.localPort = 4000;
+    blog.subdomain = "blog";  blog.localPort = 4000;       # → blog.sweater.trolltech.art
     api.subdomain  = "api";   api.localPort  = 3000;  api.auth = "public";
   };
 }
 ```
 
-DNS is reconciled in Porkbun automatically. TLS is provisioned by Caddy via
-ACME. The reverse proxy delegates auth to a dedicated tuntun service
-(`forward_auth`), which checks an Ed25519-signed session cookie scoped to the
-tenant's domain.
+The public hostname is `<service>.<tenant>.<domain>`, so two tenants on the
+same server can both have a `blog`. DNS is reconciled in Porkbun automatically
+(per-tenant `*.<tenant>.<domain>` wildcard A records). TLS is provisioned by
+Caddy via ACME. The reverse proxy delegates auth to a per-tenant login site at
+`auth.<tenant>.<domain>`, which checks an Ed25519-signed, server-revocable
+session cookie scoped to that tenant's subtree.
+
+You also automatically get reverse-SSH at `ssh.<tenant>.<domain>` — your
+laptop's local sshd, reachable from the wild internet via a bastion `sshd` on
+the server, with end-to-end SSH crypto preserved.
 
 ## Design
 
@@ -42,7 +48,7 @@ is generic over port traits — tagless final, the same pattern used in
 | From                          | What                                         |
 | ----------------------------- | -------------------------------------------- |
 | [`music-box`](https://git.sr.ht/~do/music-box) | Caddy supervisor + declarative Caddyfile generation |
-| [`orim`](https://github.com/cognivore/orim)    | Porkbun JSON API client + passveil secrets pattern |
+| [`orim`](https://github.com/cognivore/orim)    | Porkbun JSON API client + secrets-via-shell-out pattern (now over `rageveil`) |
 | [`zensurance`](https://git.sr.ht/~do/zensurance) | Per-project Nix ergonomics                |
 | [`mighty-rearranger`](https://github.com/cognivore/mighty-rearranger) | Tagless-final crate split |
 | [`nixvana`](https://github.com/cognivore/nixvana) | home-manager integration surface          |
@@ -59,18 +65,20 @@ is generic over port traits — tagless final, the same pattern used in
 
   services.tuntun-server = {
     enable = true;
-    domain = "memorici.de";
+    domain = "trolltech.art";
     publicIp = "203.0.113.42";
     porkbun = {
       apiKeyFile    = "/run/secrets/porkbun-api-key";
       secretKeyFile = "/run/secrets/porkbun-secret-key";
     };
-    tenants.jm = {
-      passwordHashFile = "/run/secrets/tuntun-jm-password-hash";
+    serverSigningKeyFile = "/run/secrets/tuntun-server-signing-key.pem";
+    tenants.sweater = {
+      passwordHashFile = "/run/secrets/tuntun-sweater-password.phc";
       authorizedKeys = [
         "ed25519:AAAA..."   # one of your laptops, see scripts/regen-client-keys.rs
       ];
     };
+    # The reverse-SSH bastion is on by default at port 2222.
   };
 }
 ```
@@ -85,9 +93,14 @@ is generic over port traits — tagless final, the same pattern used in
 
   services.tuntun-cli = {
     enable = true;
-    serverHost = "edge.memorici.de:7000";
+    serverHost = "edge.trolltech.art:7000";
     serverPubkeyFingerprint = "sha256:...";
-    defaultTenant = "jm";
+    defaultTenant = "sweater";
+    bastion = {
+      serverDomain = "trolltech.art";
+      bastionPort = 2222;
+      identityFile = "~/.ssh/id_ed25519";
+    };
   };
 }
 ```

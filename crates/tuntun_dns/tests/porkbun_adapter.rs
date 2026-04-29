@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use serde_json::json;
 use tuntun_core::testing::MockHttp;
 use tuntun_core::{
-    DnsPort, DnsRecordContent, DnsRecordKind, DnsRecordSpec, Domain, Fqdn, HttpMethod, Subdomain,
+    DnsName, DnsPort, DnsRecordContent, DnsRecordKind, DnsRecordSpec, Domain, Fqdn, HttpMethod,
     Ttl,
 };
 use tuntun_dns::{PorkbunCreds, PorkbunDns};
@@ -30,7 +30,7 @@ async fn create_a_record_round_trip() {
 
     let spec = DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new("blog").unwrap(),
+        name: DnsName::new("blog").unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(203, 0, 113, 9),
@@ -60,7 +60,7 @@ async fn create_cname_record() {
 
     let spec = DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new("api").unwrap(),
+        name: DnsName::new("api").unwrap(),
         ttl: Ttl::new(300).unwrap(),
         content: DnsRecordContent::Cname {
             target: Fqdn::new("edge.memorici.de").unwrap(),
@@ -84,7 +84,7 @@ async fn update_record_calls_edit_endpoint() {
 
     let spec = DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new("blog").unwrap(),
+        name: DnsName::new("blog").unwrap(),
         ttl: Ttl::new(120).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(1, 2, 3, 4),
@@ -113,7 +113,7 @@ async fn delete_record_calls_delete_endpoint() {
     adapter
         .delete_record(
             &apex(),
-            &Subdomain::new("blog").unwrap(),
+            &DnsName::new("blog").unwrap(),
             DnsRecordKind::Cname,
         )
         .await
@@ -136,7 +136,7 @@ async fn api_error_status_is_upstream_error() {
 
     let spec = DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new("blog").unwrap(),
+        name: DnsName::new("blog").unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(1, 2, 3, 4),
@@ -161,7 +161,7 @@ async fn http_5xx_is_upstream_error() {
     let err = adapter
         .delete_record(
             &apex(),
-            &Subdomain::new("blog").unwrap(),
+            &DnsName::new("blog").unwrap(),
             DnsRecordKind::A,
         )
         .await
@@ -192,7 +192,7 @@ async fn list_records_for_decodes_records() {
     let recs = adapter
         .list_records_for(
             &apex(),
-            &Subdomain::new("blog").unwrap(),
+            &DnsName::new("blog").unwrap(),
             DnsRecordKind::A,
         )
         .await

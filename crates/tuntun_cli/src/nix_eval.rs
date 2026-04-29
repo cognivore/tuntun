@@ -26,6 +26,11 @@ pub async fn eval_project_spec(project_dir: &Path, tuntun_flake_ref: &str) -> Re
             project_dir.display()
         ));
     }
+    // `import "./tuntun.nix"` is rejected by Nix's string→path coercion; an
+    // absolute path is required. canonicalize() also resolves any symlinks.
+    let nix_file = nix_file
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", nix_file.display()))?;
 
     let nix_path = nix_file.display();
     let expr = format!(

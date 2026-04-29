@@ -261,6 +261,34 @@ pub fn validate_domain(s: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate a DNS name fragment used relative to an apex (the `name` field on
+/// a Porkbun-style record). Allows one or more dot-separated labels; the
+/// leftmost label may be a literal `*` to denote a wildcard. All other labels
+/// must be valid DNS labels per [`validate_dns_label`].
+pub fn validate_dns_name(s: &str) -> Result<(), &'static str> {
+    if s.len() > 253 {
+        return Err("DNS name exceeds 253 characters");
+    }
+    if s.contains("..") {
+        return Err("DNS name has empty label");
+    }
+    let mut iter = s.split('.');
+    let first = iter.next().ok_or("DNS name must not be empty")?;
+    if first.is_empty() {
+        return Err("DNS name has empty label");
+    }
+    if first != "*" {
+        validate_dns_label(first)?;
+    }
+    for label in iter {
+        if label.is_empty() {
+            return Err("DNS name has empty label");
+        }
+        validate_dns_label(label)?;
+    }
+    Ok(())
+}
+
 /// Tenant ids, project ids, service names: lowercase alnum + hyphen, 1..=64.
 pub fn validate_slug(s: &str) -> Result<(), &'static str> {
     if s.len() > 64 {
@@ -332,5 +360,45 @@ mod tests {
     fn domain_rejects_bad() {
         assert!(validate_domain("foo..bar").is_err());
         assert!(validate_domain("FOO.com").is_err());
+    }
+
+    #[test]
+    fn dns_name_accepts_single_label() {
+        assert!(validate_dns_name("blog").is_ok());
+    }
+
+    #[test]
+    fn dns_name_accepts_multi_label() {
+        assert!(validate_dns_name("blog.sweater").is_ok());
+        assert!(validate_dns_name("a.b.c").is_ok());
+    }
+
+    #[test]
+    fn dns_name_accepts_leading_wildcard() {
+        assert!(validate_dns_name("*").is_ok());
+        assert!(validate_dns_name("*.sweater").is_ok());
+        assert!(validate_dns_name("*.sweater.dev").is_ok());
+    }
+
+    #[test]
+    fn dns_name_rejects_wildcard_in_middle() {
+        // Star anywhere but the leftmost label is rejected — that's neither
+        // an RFC 4592 wildcard nor a valid DNS label.
+        assert!(validate_dns_name("blog.*.sweater").is_err());
+        assert!(validate_dns_name("blog.*").is_err());
+    }
+
+    #[test]
+    fn dns_name_rejects_empty_or_double_dot() {
+        assert!(validate_dns_name("").is_err());
+        assert!(validate_dns_name("a..b").is_err());
+        assert!(validate_dns_name(".blog").is_err());
+        assert!(validate_dns_name("blog.").is_err());
+    }
+
+    #[test]
+    fn dns_name_rejects_uppercase_or_underscore() {
+        assert!(validate_dns_name("Blog").is_err());
+        assert!(validate_dns_name("blog_prod").is_err());
     }
 }

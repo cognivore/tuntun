@@ -1,7 +1,7 @@
 //! Validated identifier types used throughout the workspace.
 
 use crate::id::{
-    validate_dns_label, validate_domain, validate_secret_key, validate_slug,
+    validate_dns_label, validate_dns_name, validate_domain, validate_secret_key, validate_slug,
 };
 use crate::{define_id, define_numeric_id};
 
@@ -30,6 +30,14 @@ define_id!(
 );
 
 define_id!(
+    /// A DNS name fragment used as the `name` of a record, relative to its
+    /// apex. Permits multi-label values (e.g., `blog.sweater`) and a literal
+    /// `*` as the leftmost label for wildcards (e.g., `*.sweater`).
+    pub DnsName,
+    validate = validate_dns_name,
+);
+
+define_id!(
     /// A fully-qualified domain name.
     pub Domain,
     validate = validate_domain,
@@ -53,7 +61,7 @@ define_id!(
 );
 
 define_id!(
-    /// passveil-style secret key path (e.g., "tuntun/tunnel-private-key").
+    /// rageveil-style secret key path (e.g., "tuntun/tunnel-private-key").
     pub SecretKey,
     validate = validate_secret_key,
 );

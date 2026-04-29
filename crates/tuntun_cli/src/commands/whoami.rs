@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 
 use tuntun_core::{SecretKey, SecretPort};
 
-use crate::adapters::secret::PassveilSecrets;
+use crate::adapters::secret::RageveilSecrets;
 use crate::config::DaemonConfig;
 
 pub async fn run(config: Option<&Path>) -> Result<()> {
@@ -16,11 +16,11 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     let key_name = SecretKey::new(cfg.private_key_secret_name.clone())
         .map_err(|e| anyhow::anyhow!("invalid private_key_secret_name: {e}"))?;
 
-    let secrets = PassveilSecrets::new();
+    let secrets = RageveilSecrets::new();
     let value = secrets
         .load(&key_name)
         .await
-        .context("load tunnel private key from passveil")?;
+        .context("load tunnel private key from rageveil")?;
 
     let pem = std::str::from_utf8(value.expose_bytes())
         .context("private key is not utf-8")?;

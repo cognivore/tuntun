@@ -76,11 +76,10 @@ pub enum AuthPolicy {
     /// Only authenticated tenant members may reach the service.
     #[default]
     Tenant,
-    /// Anyone on the public internet may reach the service.
+    /// Anyone on the public internet may reach the service. The tenant
+    /// session-cookie gate is bypassed; the service is responsible for any
+    /// auth it cares about (e.g., its own login screen).
     Public,
-    /// No auth gate; reserved for explicit opt-out (treated like
-    /// [`AuthPolicy::Public`] but distinguishable in policy decisions).
-    None,
 }
 
 /// Health-check probe configuration for a service.

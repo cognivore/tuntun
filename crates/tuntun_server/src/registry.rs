@@ -12,14 +12,30 @@ use tokio::sync::{mpsc, RwLock};
 use tuntun_core::{Fqdn, ProjectId, ServiceName, ServicePort, TenantId, TunnelClientId};
 use tuntun_proto::{AuthPolicy, ControlFrame, HealthCheckSpec};
 
+use crate::tunnel::per_service_listener::OpenStreamRequest;
+
 const PORT_FLOOR: u16 = 20_000;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientRecord {
     pub client_id: TunnelClientId,
     pub tenant: TenantId,
     pub control_tx: mpsc::Sender<ControlFrame>,
+    /// Channel into the session's stream-opener task. External components
+    /// (notably the SSH bastion side-car) clone this to ask the session to
+    /// allocate a yamux stream and pipe bytes from an inbound transport.
+    pub stream_tx: mpsc::Sender<OpenStreamRequest>,
     pub projects: BTreeMap<ProjectId, ProjectRecord>,
+}
+
+impl std::fmt::Debug for ClientRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientRecord")
+            .field("client_id", &self.client_id)
+            .field("tenant", &self.tenant)
+            .field("projects", &self.projects)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +130,23 @@ impl Registry {
             .await
             .fqdn_to_client
             .get(fqdn)
+            .cloned()
+    }
+
+    /// Find the [`ClientRecord`] currently serving the given tenant, if any.
+    /// Used by the SSH bastion side-car to dispatch incoming bastion
+    /// connections to the right connected laptop.
+    ///
+    /// At most one client is expected per tenant in v1; if multiple clients
+    /// have registered for the same tenant we return the lexicographically
+    /// first one (deterministic, but the multi-client case is not yet a
+    /// supported configuration).
+    pub async fn lookup_by_tenant(self: &Arc<Self>, tenant: &TenantId) -> Option<ClientRecord> {
+        let inner = self.inner.read().await;
+        inner
+            .clients
+            .values()
+            .find(|c| &c.tenant == tenant)
             .cloned()
     }
 }

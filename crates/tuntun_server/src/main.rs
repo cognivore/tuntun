@@ -63,9 +63,29 @@ enum Command {
 
     /// Reconcile DNS records once and exit (admin tool).
     ReconcileDns,
+
+    /// SSH bastion `ForceCommand` helper. Pipes stdin/stdout through the
+    /// running daemon's bastion unix socket to the named tenant's tunnel.
+    /// Not for direct human use — the NixOS module wires this into
+    /// `~tuntun/.ssh/authorized_keys`.
+    #[command(hide = true)]
+    TcpForward {
+        /// Tenant id whose tunnel the connection should be routed to.
+        tenant: String,
+    },
 }
 
 fn main() -> ExitCode {
+    // rustls 0.23 requires the crypto provider to be installed once before
+    // any TLS code runs, otherwise it panics on first use. We pin `ring`
+    // (matches workspace feature flag).
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Already installed (e.g., by a parent process). Not fatal.
+    }
+
     let cli = Cli::parse();
 
     if let Err(e) = init_tracing(cli.verbose) {
@@ -89,6 +109,9 @@ fn main() -> ExitCode {
             Command::Run => commands::run::run(cli.config.as_deref()).await,
             Command::PrintConfig => commands::print_config::run(cli.config.as_deref()).await,
             Command::ReconcileDns => commands::reconcile_dns::run(cli.config.as_deref()).await,
+            Command::TcpForward { tenant } => {
+                commands::tcp_forward::run(cli.config.as_deref(), &tenant).await
+            }
         }
     });
 

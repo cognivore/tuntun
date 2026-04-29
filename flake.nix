@@ -129,5 +129,13 @@
         tuntun-cli = homeManagerModule;
       };
       lib = tuntunLib;
+
+      nixosConfigurations.tuntun-aws = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux";
+        modules = [
+          nixosModule
+          ./nix/hosts/tuntun-aws.nix
+        ];
+      };
     };
 }

@@ -16,11 +16,11 @@ use tuntun_core::{
 };
 use tuntun_proto::{
     decode_frame, encode_frame, AuthChallengeFrame, AuthPolicy, AuthRequestFrame,
-    AuthResponseFrame, AuthResultFrame, ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame,
-    FrameBuffer, HealthCheckSpec, HelloFrame, PingFrame, PongFrame, ProjectRegistration,
-    ProtoError, RegisterFrame, RegisteredFrame, ServiceAllocation, ServiceRegistration,
-    StreamCloseFrame, StreamCloseReason, StreamDataFrame, StreamOpenFrame, WelcomeFrame,
-    MAX_FRAME_LEN, PROTOCOL_VERSION,
+    AuthResponseFrame, AuthResultFrame, BuiltinService, ControlFrame, DeregisterFrame, ErrorCode,
+    ErrorFrame, FrameBuffer, HealthCheckSpec, HelloFrame, PingFrame, PongFrame,
+    ProjectRegistration, ProtoError, RegisterFrame, RegisteredFrame, ServiceAllocation,
+    ServiceRegistration, StreamCloseFrame, StreamCloseReason, StreamDataFrame,
+    StreamOpenBuiltinFrame, StreamOpenFrame, WelcomeFrame, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 
 fn tenant() -> TenantId {
@@ -168,6 +168,10 @@ fn all_frames() -> Vec<ControlFrame> {
         ControlFrame::Error(ErrorFrame {
             code: ErrorCode::UnknownProject,
             message: "no such project".to_string(),
+        }),
+        ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame {
+            stream_id: 99,
+            kind: BuiltinService::Ssh,
         }),
     ]
 }

@@ -8,8 +8,8 @@ use std::net::Ipv4Addr;
 use serde_json::json;
 use tuntun_core::testing::MockHttp;
 use tuntun_core::{
-    DnsPort, DnsRecord, DnsRecordContent, DnsRecordId, DnsRecordKind, DnsRecordSpec, Domain,
-    Subdomain, Ttl,
+    DnsName, DnsPort, DnsRecord, DnsRecordContent, DnsRecordId, DnsRecordKind, DnsRecordSpec,
+    Domain, Ttl,
 };
 use tuntun_dns::{plan_dns_reconciliation, DnsAction, PorkbunCreds, PorkbunDns};
 
@@ -20,7 +20,7 @@ fn apex() -> Domain {
 fn spec(name: &str, ip: [u8; 4]) -> DnsRecordSpec {
     DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new(name).unwrap(),
+        name: DnsName::new(name).unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
@@ -32,7 +32,7 @@ fn observed(id: &str, name: &str, ip: [u8; 4]) -> DnsRecord {
     DnsRecord {
         id: DnsRecordId::new(id).unwrap(),
         apex: apex(),
-        name: Subdomain::new(name).unwrap(),
+        name: DnsName::new(name).unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
@@ -151,7 +151,7 @@ async fn cname_kind_is_distinct_from_a() {
 
     let desired = vec![DnsRecordSpec {
         apex: apex(),
-        name: Subdomain::new("api").unwrap(),
+        name: DnsName::new("api").unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::Cname {
             target: Fqdn::new("edge.memorici.de").unwrap(),
@@ -160,7 +160,7 @@ async fn cname_kind_is_distinct_from_a() {
     let observed_set = vec![DnsRecord {
         id: DnsRecordId::new("rec-a").unwrap(),
         apex: apex(),
-        name: Subdomain::new("api").unwrap(),
+        name: DnsName::new("api").unwrap(),
         ttl: Ttl::new(60).unwrap(),
         content: DnsRecordContent::A {
             ip: Ipv4Addr::new(1, 2, 3, 4),

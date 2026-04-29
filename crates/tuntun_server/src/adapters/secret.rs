@@ -28,12 +28,20 @@ impl SecretPort for CredentialDirSecrets {
     async fn load(&self, key: &SecretKey) -> Result<SecretValue> {
         let path = Self::resolve(key)
             .ok_or_else(|| Error::not_found("secret", key.as_str()))?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        let mut bytes = tokio::fs::read(&path).await.map_err(|e| {
             Error::port(
                 "credential-dir",
                 format!("read {}: {e}", path.display()),
             )
         })?;
+        // Strip a single trailing CR/LF pair. Operators routinely write
+        // secrets via `cat > file`, which appends a newline. PEM payloads
+        // (signing keys, certs) handle the trailing newline themselves; flat
+        // tokens (Porkbun keys, Argon2id PHC) do not, and JSON-serializing a
+        // trailing `\n` produces an "Invalid API key" from Porkbun.
+        while matches!(bytes.last(), Some(&(b'\n' | b'\r'))) {
+            bytes.pop();
+        }
         Ok(SecretValue::from_bytes(bytes))
     }
 

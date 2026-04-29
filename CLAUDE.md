@@ -41,14 +41,17 @@ Do not add Ubuntu / system-manager / generic-Linux deployment paths.
                                                                     │
 ┌──────────────┐    HTTPS         ┌─────────────────────────────────▼────────────┐
 │ Browser /    │ ───────────────▶ │            Remote server                     │
-│ end-user     │  *.tenant.tld    │                                              │
+│ end-user     │ *.<t>.<domain>   │                                              │
 └──────────────┘                  │  ┌────────┐    ┌──────────────────────────┐  │
                                   │  │ Caddy  │◀──▶│ tuntun_server (daemon)   │  │
                                   │  │  TLS   │    │  - tunnel acceptor       │  │
                                   │  │ ACME   │    │  - project registry      │  │
                                   │  │forward_│    │  - Caddyfile generator   │  │
-                                  │  │  auth  │    │  - forward_auth endpoint │  │
+                                  │  │  auth  │    │  - per-tenant /login,    │  │
+                                  │  │        │    │    /verify, /logout      │  │
                                   │  └────────┘    │  - Porkbun reconciler    │  │
+                                  │                │  - SSH bastion side-car  │  │
+                                  │                │    (sshd :2222)          │  │
                                   │                └──────────────────────────┘  │
                                   └──────────────────────────────────────────────┘
                                                 ▲
@@ -65,9 +68,15 @@ The user types `tuntun .` in a project directory that contains a `tuntun.nix`
 file. The CLI evaluates that file with `nix eval --json`, registers each
 declared service with the server over the control protocol, and the server
 generates a Caddyfile, reloads Caddy, and starts proxying public traffic
-through the tunnel back to the laptop. DNS records on Porkbun are reconciled
-by the server (or by the CLI in laptop-only mode) so that `*.tenant.tld`
-resolves to the server's IP.
+through the tunnel back to the laptop.
+
+**URL pattern**: every public hostname is `<service>.<tenant>.<domain>`. The
+tenant is part of the URL so two tenants on the same server can each declare
+a service called `blog` without colliding. DNS records on Porkbun are
+reconciled by the server as one wildcard A record per tenant
+(`*.<tenant>.<domain>`), which covers all current and future services for
+that tenant — including the auto-provisioned reverse-SSH endpoint at
+`ssh.<tenant>.<domain>`.
 
 ### Architecture, in three sentences
 
@@ -95,6 +104,15 @@ nix flake check                   # evaluate all flake outputs
 # Run the laptop CLI against a local fake server (integration smoke test):
 cargo run -p tuntun_cli -- --dry-run register .
 ```
+
+## Provisioning the production server
+
+The AWS EC2 / NixOS provisioning runbook lives at
+[`AWS_PROVISION.md`](./AWS_PROVISION.md). It is the authoritative source for
+turning an empty AWS account into a running tuntun-server box. If you are an
+agent and the user asks for provisioning, deployment, or "spinning up the
+server", read that file first and follow its `Operating notes for an AI
+agent` section.
 
 ## Operational scripts
 
@@ -222,27 +240,56 @@ For numeric ports/ttls, use `u16`/`u32` newtypes via `define_numeric_id!`.
 ### 5. Authentication is cryptographically rigorous
 
 This is the most security-sensitive part of the system. Apply these rules
-literally:
+literally. They cover the **end-user web auth** surface; tunnel-client and
+SSH-bastion auth are key-based (Ed25519, see §9 and the bastion section).
 
 - **Password hashing**: Argon2id only. Parameters: `m_cost = 19_456`,
   `t_cost = 2`, `p_cost = 1` (matches OWASP 2024 guidance). Stored as
   PHC-format strings.
 - **Session tokens**: Ed25519-signed envelopes carrying
-  `(tenant_id, label, issued_at, expires_at, nonce)`. Signed by the server's
-  long-term ed25519 private key. Public key pinned in the auth verifier.
+  `(tenant_id, label, issued_at, expires_at, nonce)`, postcard-encoded payload
+  + 64-byte signature, base64url with a `.` between them (JWS-shaped, no
+  JOSE header — there is no `alg` field for an attacker to lie about). Signed
+  by the server's long-term ed25519 private key.
 - **Tunnel client auth**: Ed25519 challenge-response. Server sends a 32-byte
-  random nonce; client signs `b"tuntun-tunnel-auth-v1" || nonce || tenant_id`.
-  Server verifies the signature against the per-tenant `authorized_keys` set.
-  Domain separator required to defeat cross-protocol attacks.
+  random nonce; client signs
+  `b"tuntun-tunnel-auth-v1\0" || nonce || tenant_id`. Server verifies the
+  signature against the per-tenant `authorized_keys` set. The domain
+  separator (with trailing NUL) is mandatory — it defeats cross-protocol
+  signature replay.
 - **Constant-time comparison**: All MAC/signature/hash comparisons go through
-  `subtle::ConstantTimeEq`. Never `==` on bytes.
+  `subtle::ConstantTimeEq`. Never `==` on bytes. `argon2::verify` and
+  `ed25519_dalek::verify_strict` already do this internally; the auth
+  endpoint also uses `ct_eq` for the CSRF double-submit check.
+- **Strict signature verification**: Always `verify_strict` on the verifier
+  side, never `verify`. This rejects the malleable encoding from RFC 8032
+  §5.1.7.
 - **No homegrown crypto**: Use `argon2`, `ed25519-dalek`, `rustls`,
   `rand::rngs::OsRng`. Do not write a custom AEAD, KDF, or RNG.
-- **Cookies**: `HttpOnly`, `Secure`, `SameSite=Lax`, `Domain=.tenant.tld`,
-  `Path=/`, `Max-Age=3600`. Login form has CSRF token (random per-session).
+- **Per-tenant cookie scoping**: cookies carry `Domain=.<tenant>.<domain>`,
+  `Path=/`, `Max-Age=3600`, `Secure`, `HttpOnly`, `SameSite=Lax`. Each tenant
+  has its own login site at `auth.<tenant>.<domain>` so the browser will
+  never send tenant A's cookie to tenant B's services. The verifier
+  cross-checks the cookie's `tenant` claim against the request host as
+  defense in depth.
+- **Server-side revocation**: every issued session is identified by its
+  `nonce`. `POST /logout` adds the nonce to a persistent JSON revocation set
+  at `<state_dir>/revoked-nonces.json`; `/verify` consults the set after
+  signature/expiry checks. Entries are purged lazily once their original
+  `expires_at` has passed, so the set stays bounded.
+- **CSRF on login & logout**: double-submit pattern. `GET /login` mints a
+  256-bit OsRng token, sets it as `tuntun_csrf` (`HttpOnly`,
+  `SameSite=Strict`, scoped to the same tenant subtree) and embeds it as a
+  hidden `_csrf` form field. `POST /login` and `POST /logout` reject any
+  request whose form `_csrf` does not equal the cookie value (compared via
+  `ct_eq`).
+- **Open-redirect defense**: `?redirect=` parameters on `/login` are
+  whitelisted to server-relative paths (`^/[^/]`); anything else falls back
+  to `/`.
 - **Rate limit**: Login endpoint rate-limited per IP via token bucket
-  (5 attempts / 60s, refill 1/30s). Exhaustion returns HTTP 429 without
-  revealing whether the password was correct.
+  (capacity 5, refill 1 token / 30 s, cost 1 / attempt). 429 is returned
+  *before* Argon2id verification so the response is constant-cost regardless
+  of whether the tenant or password exists.
 
 ### 6. Workspace lints
 
@@ -282,24 +329,31 @@ clock.
 Each library crate ships a `tests/` directory with at least one integration
 test that exercises the public API end-to-end with mocks.
 
-### 9. Secrets via passveil
+### 9. Secrets via rageveil
 
-All secrets are loaded at runtime through `SecretPort`. The real adapter
-shells out to `passveil show <key>`. Keys are namespaced under `tuntun/`:
+All laptop-side secrets are loaded at runtime through `SecretPort`. The real
+adapter shells out to `rageveil show <key>` (`rageveil` is a git+age password
+manager whose CLI shape is near-identical to `passveil` —
+`show <path>`, `insert <path> --batch`, `list`, `sync`). Server-side secrets
+are loaded by systemd `LoadCredential` and surfaced through
+`${CREDENTIALS_DIRECTORY}/<name>`; the daemon never reads from arbitrary
+paths.
 
-| Key                              | Where      | Contents                                  |
-| -------------------------------- | ---------- | ----------------------------------------- |
-| `tuntun/tunnel-private-key`      | laptop     | Ed25519 private key (PKCS#8)              |
-| `tuntun/server-host`             | laptop     | `host:port` of server's tunnel acceptor   |
+| Key                                | Where    | Contents                                  |
+| ---------------------------------- | -------- | ----------------------------------------- |
+| `tuntun/tunnel-private-key`        | laptop   | Ed25519 private key (PKCS#8 PEM)          |
 | `tuntun/server-pubkey-fingerprint` | laptop   | SHA-256 of server's pinned cert (hex)     |
-| `tuntun/porkbun-api`             | server     | `api_key\nsecret_key`                     |
-| `tuntun/server-signing-key`      | server     | Ed25519 private key for session tokens    |
-| `tuntun/tenant/<id>/password-hash` | server   | Argon2id PHC hash for tenant guest access |
+| `tuntun/tenant/<id>/password`      | laptop   | Tenant guest password (32-char base64url) |
+| `${CREDENTIALS_DIRECTORY}/porkbun-api-key`        | server | Porkbun API key       |
+| `${CREDENTIALS_DIRECTORY}/porkbun-secret-key`     | server | Porkbun secret key    |
+| `${CREDENTIALS_DIRECTORY}/server-signing-key`     | server | Ed25519 PKCS#8 PEM    |
+| `${CREDENTIALS_DIRECTORY}/tenant-password-<id>`   | server | Argon2id PHC hash     |
 
 Secrets must never be committed, logged, or included in error messages. The
 `SecretPort::load` adapter must redact in `Debug` impls. Keys to be persisted
-(e.g., a freshly generated tunnel keypair on first run) are stored via
-`passveil insert`.
+on the laptop (e.g., a freshly generated tunnel keypair) are stored via
+`rageveil insert <path> --batch`. The `--batch` flag is mandatory in scripts
+so a daemon-side regeneration never blocks on an interactive prompt.
 
 ### 10. Resilience defaults
 
@@ -350,7 +404,7 @@ declarative Caddyfile generation, supervisor process restarts on crash.
 | ---------------------------- | -------------------------------------- |
 | Caddy supervisor + Caddyfile | `~/Srht/music-box/nix/home-manager.nix` |
 | Porkbun upsert pattern       | `~/Github/orim/scripts/lib.sh:121-160`  |
-| passveil for secrets         | `~/Github/orim/scripts/lib.sh:110-117`  |
+| rageveil for secrets         | git+age password manager, drop-in shape with the orim shell-out pattern |
 | Tagless-final crate split    | `~/Github/mighty-rearranger/CLAUDE.md`  |
 | Per-project Nix ergonomics   | `~/Srht/zensurance/flake.nix`           |
 | Home-manager service module  | `~/Github/nixvana/home-manager/include/services/backup-darwin.nix` |
@@ -365,13 +419,13 @@ A project declares its tuntun configuration like this:
 { tuntun, ... }:
 
 tuntun.mkProject {
-  tenant = "memorici-de";              # tenant id (server-side)
-  domain = "memorici.de";              # owned in Porkbun
+  tenant = "sweater";                  # tenant id (server-side)
+  domain = "trolltech.art";            # owned in Porkbun
   services = {
     blog = {
-      subdomain = "blog";              # → blog.memorici.de
+      subdomain = "blog";              # → blog.sweater.trolltech.art
       localPort = 4000;                # local app port on laptop
-      auth = "tenant";                 # "tenant" | "public" | "none"
+      auth = "tenant";                 # "tenant" | "public"
       healthCheck.path = "/_health";   # optional
     };
     api = {
@@ -383,8 +437,57 @@ tuntun.mkProject {
 }
 ```
 
+The public hostname for each service is **`<subdomain>.<tenant>.<domain>`**.
+The tenant is part of the URL so two tenants on the same `tuntun-server` can
+each declare a service called `blog` without colliding. DNS is reconciled by
+the server as a per-tenant wildcard A record `*.<tenant>.<domain>`, which
+covers all of that tenant's services (and the SSH bastion entry, see below)
+with a single record.
+
 Evaluated to JSON by `nix eval --json -f tuntun.nix --apply '...'`. Schema
 lives in `tuntun_config::ProjectSpec`.
+
+## Reverse-SSH bastion side-car
+
+In addition to the user-declared services, each connected tenant
+automatically gets a reverse-SSH endpoint at
+**`ssh ssh.<tenant>.<domain>`**. The flow:
+
+```
+laptop sshd (127.0.0.1:22)
+        ▲
+        │  yamux stream (StreamOpenBuiltin{Ssh})
+        │  inside the tenant's existing outbound tunnel
+        │
+   tuntun_server
+        ▲
+        │  /var/lib/tuntun/bastion.sock  (unix socket, header `tenant=<id>\n`)
+        │
+   tuntun-server tcp-forward <tenant>     ← OpenSSH `ForceCommand`
+        ▲
+   sshd (port 2222, Match LocalPort)      ← bastion side of the tuntun-server box
+        ▲
+   ssh ssh.sweater.trolltech.art          ← user's laptop / colleague's machine
+```
+
+Key properties:
+
+- **End-to-end SSH crypto**. The bastion `sshd` only authenticates the *jump*
+  via `command="tuntun-server tcp-forward <tenant>",no-pty,…` lines in its
+  `AuthorizedKeysCommand` output. The forced command is a dumb byte pipe; it
+  never reads the inner SSH session.
+- **Tenant identity is bound to the public key**, not to the SSH username.
+  The `command=` prefix on each authorized line uniquely binds a key to a
+  tenant. The home-manager module writes a matching `Host` block to
+  `~/.ssh/config` so users still type plain `ssh ssh.<tenant>.<domain>`.
+- **Reverse**, not forward: the laptop never accepts public inbound TCP. The
+  server reaches into the laptop's already-open tunnel by emitting a new
+  `StreamOpenBuiltin{Ssh}` control frame; the laptop's daemon dials its own
+  `127.0.0.1:<sshLocalPort>` (default 22) and pumps bytes.
+- **No second sshd**. The bastion is wired into the existing
+  `services.openssh` instance via a `Match LocalPort <bastionPort>` block,
+  which scopes the forced-command behavior to the bastion port and leaves
+  admin SSH on port 22 untouched.
 
 ## Daemon ↔ CLI handoff
 
@@ -407,17 +510,25 @@ races. The `notify` crate is already in the dependency graph for that.
 ```nix
 services.tuntun-server = {
   enable = true;
-  domain = "memorici.de";
+  domain = "trolltech.art";
   publicIp = "203.0.113.42";
   porkbun = {
     apiKeyFile = "/run/secrets/porkbun-api-key";
     secretKeyFile = "/run/secrets/porkbun-secret-key";
   };
   tunnelListen = "0.0.0.0:7000";
-  tenants.jm = {
-    passwordHashFile = "/run/secrets/tuntun-jm-password-hash";
+
+  # Reverse-SSH bastion side-car. Defaults: enable = true; bastionPort = 2222.
+  # The bastion attaches to the existing `services.openssh` via Match LocalPort.
+  ssh = {
+    enable = true;
+    bastionPort = 2222;
+  };
+
+  tenants.sweater = {
+    passwordHashFile = "/run/secrets/tuntun-sweater-password-hash";
     authorizedKeys = [
-      "ed25519:AAAA..."   # laptop public keys
+      "ed25519:AAAA..."   # laptop public keys; same keys gate the SSH bastion
     ];
   };
 };
@@ -428,10 +539,20 @@ services.tuntun-server = {
 ```nix
 services.tuntun-cli = {
   enable = true;
-  serverHost = "edge.memorici.de:7000";
+  serverHost = "edge.trolltech.art:7000";
   serverPubkeyFingerprint = "sha256:...";
   privateKeySource = "passveil:tuntun/tunnel-private-key";
-  defaultTenant = "jm";
+  defaultTenant = "sweater";
+
+  # Generates a `Host ssh.<defaultTenant>.<serverDomain>` block in
+  # ~/.ssh/config so `ssh ssh.sweater.trolltech.art` works out of the box.
+  bastion = {
+    enable = true;
+    serverDomain = "trolltech.art";
+    bastionPort = 2222;
+    sshLocalPort = 22;          # the laptop's local sshd
+    identityFile = "~/.ssh/id_ed25519";
+  };
 };
 ```
 

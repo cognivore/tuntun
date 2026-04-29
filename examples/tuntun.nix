@@ -29,7 +29,7 @@ tuntun.mkProject {
 
   services = {
     blog = {
-      subdomain = "blog";          # public hostname → blog.memorici.de
+      subdomain = "blog";          # public hostname → blog.<tenant>.<domain>
       localPort = 4000;            # the app on your laptop
       auth = "tenant";             # require tenant password (default)
       healthCheck = {
@@ -50,4 +50,9 @@ tuntun.mkProject {
       auth = "tenant";
     };
   };
+
+  # `ssh ssh.<tenant>.<domain>` is provisioned automatically as a reverse-SSH
+  # side-car alongside the services declared above. There is no per-project
+  # config for it — it follows directly from the tenant's authorizedKeys on
+  # the server.
 }

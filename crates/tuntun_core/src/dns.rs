@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{DnsRecordId, Domain, Fqdn, Subdomain, Ttl};
+use crate::ids::{DnsName, DnsRecordId, Domain, Fqdn, Ttl};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -63,7 +63,7 @@ impl DnsRecordContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRecordSpec {
     pub apex: Domain,
-    pub name: Subdomain,
+    pub name: DnsName,
     pub ttl: Ttl,
     pub content: DnsRecordContent,
 }
@@ -73,7 +73,7 @@ pub struct DnsRecordSpec {
 pub struct DnsRecord {
     pub id: DnsRecordId,
     pub apex: Domain,
-    pub name: Subdomain,
+    pub name: DnsName,
     pub ttl: Ttl,
     pub content: DnsRecordContent,
 }
@@ -111,7 +111,7 @@ mod tests {
     fn record_match() {
         let spec = DnsRecordSpec {
             apex: Domain::new("example.com").unwrap(),
-            name: Subdomain::new("blog").unwrap(),
+            name: DnsName::new("blog").unwrap(),
             ttl: Ttl::new(60).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(1, 2, 3, 4),

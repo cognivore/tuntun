@@ -1,7 +1,7 @@
 #!/usr/bin/env rust-script
 //! Regenerate the tuntun server's long-term ed25519 signing key and write it
-//! into passveil at `tuntun/server-signing-key`. Also prints the corresponding
-//! public key so you can pin it on laptops via
+//! into rageveil at `tuntun/server-signing-key`. Also prints the corresponding
+//! public-key fingerprint so you can pin it on laptops via
 //! `tuntun/server-pubkey-fingerprint`.
 //!
 //! IMPORTANT: After editing this script, run it as
@@ -40,8 +40,8 @@ fn main() -> Result<()> {
     println!("== generated tuntun server signing key ==");
     println!("public key fingerprint: sha256:{fp_hex}");
 
-    let status = Command::new("passveil")
-        .args(["insert", "tuntun/server-signing-key"])
+    let status = Command::new("rageveil")
+        .args(["insert", "tuntun/server-signing-key", "--batch"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .and_then(|mut child| {
@@ -53,17 +53,17 @@ fn main() -> Result<()> {
                 .write_all(pem.as_bytes())?;
             child.wait()
         })
-        .context("spawn passveil insert")?;
+        .context("spawn rageveil insert")?;
 
     if !status.success() {
-        anyhow::bail!("passveil insert failed: {status}");
+        anyhow::bail!("rageveil insert failed: {status}");
     }
 
     println!();
     println!("Wrote tuntun/server-signing-key.");
     println!("Next: pin the fingerprint on each laptop with");
-    println!("    passveil insert tuntun/server-pubkey-fingerprint");
-    println!("    (then paste:  sha256:{fp_hex})");
+    println!("    rageveil insert tuntun/server-pubkey-fingerprint --batch");
+    println!("    (then pipe:   sha256:{fp_hex})");
 
     Ok(())
 }

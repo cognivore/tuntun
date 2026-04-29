@@ -20,6 +20,10 @@ pub struct ServerConfig {
     pub caddy_log: PathBuf,
     pub acme_email: String,
     pub tenants_file: PathBuf,
+    /// Path of the unix-domain socket the SSH bastion side-car listens on.
+    /// The OpenSSH `ForceCommand` helper (`tuntun-server tcp-forward`)
+    /// connects to this path.
+    pub bastion_socket: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,5 +104,6 @@ fn parse_minimal_toml(bytes: &[u8]) -> Result<ServerConfig> {
         caddy_log: PathBuf::from(take("caddy_log")?),
         acme_email: take("acme_email")?,
         tenants_file: PathBuf::from(take("tenants_file")?),
+        bastion_socket: PathBuf::from(take("bastion_socket")?),
     })
 }

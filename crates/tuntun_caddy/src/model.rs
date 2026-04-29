@@ -13,8 +13,11 @@ pub struct CaddyInput {
     pub global: GlobalConfig,
     /// Forward-auth endpoint that gates tenant-protected services.
     pub auth_endpoint: AuthEndpointConfig,
-    /// The login site (e.g. `auth.memorici.de`) that hosts the login flow.
-    pub login_site: LoginSiteConfig,
+    /// One login site per tenant, served at `auth.<tenant>.<domain>`. The
+    /// upstream is shared (a single internal HTTP service that reads the
+    /// `Host` header to know which tenant the request belongs to). Order is
+    /// preserved verbatim in the output for determinism.
+    pub login_sites: Vec<LoginSiteConfig>,
     /// Per-service sites. Order is preserved verbatim in the output.
     pub services: Vec<ServiceSite>,
 }
@@ -68,10 +71,7 @@ pub struct ServiceSite {
 pub enum AuthPolicy {
     /// Tenant-protected: emit `forward_auth` before `reverse_proxy`.
     Tenant,
-    /// Public: no edge auth (e.g., a public API).
+    /// Public: no edge auth (e.g., a public API or a service that runs its
+    /// own login).
     Public,
-    /// No edge auth (e.g., a service authenticated entirely upstream).
-    /// Currently emits the same Caddy directives as [`AuthPolicy::Public`];
-    /// the variants differ in higher layers.
-    None,
 }

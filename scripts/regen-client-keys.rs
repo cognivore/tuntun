@@ -1,6 +1,6 @@
 #!/usr/bin/env rust-script
 //! Generate a fresh ed25519 keypair for a laptop client. Stores the private
-//! key in passveil at `tuntun/tunnel-private-key` and prints the corresponding
+//! key in rageveil at `tuntun/tunnel-private-key` and prints the corresponding
 //! `authorized_keys`-style line for inclusion in the server's
 //! `services.tuntun-server.tenants.<id>.authorizedKeys` list.
 //!
@@ -33,20 +33,20 @@ fn main() -> Result<()> {
         .context("encode pkcs8 pem")?;
     let pub_b64 = STANDARD_NO_PAD.encode(signing.verifying_key().to_bytes());
 
-    let mut child = Command::new("passveil")
-        .args(["insert", "tuntun/tunnel-private-key"])
+    let mut child = Command::new("rageveil")
+        .args(["insert", "tuntun/tunnel-private-key", "--batch"])
         .stdin(std::process::Stdio::piped())
         .spawn()
-        .context("spawn passveil insert")?;
+        .context("spawn rageveil insert")?;
     child
         .stdin
         .as_mut()
         .expect("piped stdin")
         .write_all(pem.as_bytes())
-        .context("write key to passveil stdin")?;
-    let status = child.wait().context("wait passveil")?;
+        .context("write key to rageveil stdin")?;
+    let status = child.wait().context("wait rageveil")?;
     if !status.success() {
-        anyhow::bail!("passveil insert failed: {status}");
+        anyhow::bail!("rageveil insert failed: {status}");
     }
 
     println!("Wrote tuntun/tunnel-private-key.");

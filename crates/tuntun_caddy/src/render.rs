@@ -21,15 +21,17 @@ const HEALTH_INTERVAL: &str = "30s";
 ///
 /// # Errors
 ///
-/// Returns [`CaddyError::DuplicateFqdn`] if any two services share the same
-/// FQDN.
+/// Returns [`CaddyError::DuplicateFqdn`] if any two service- or login-sites
+/// share the same FQDN.
 pub fn render_caddyfile(input: &CaddyInput) -> Result<String, CaddyError> {
-    validate_unique_fqdns(&input.services)?;
+    validate_unique_fqdns(input)?;
 
     let mut out = String::new();
 
     render_global_block(&mut out, input);
-    render_login_site(&mut out, input);
+    for login in &input.login_sites {
+        render_login_site(&mut out, login);
+    }
     for service in &input.services {
         render_service_site(&mut out, input, service);
     }
@@ -37,9 +39,18 @@ pub fn render_caddyfile(input: &CaddyInput) -> Result<String, CaddyError> {
     Ok(out)
 }
 
-fn validate_unique_fqdns(services: &[ServiceSite]) -> Result<(), CaddyError> {
-    let mut seen: HashSet<&str> = HashSet::with_capacity(services.len());
-    for s in services {
+fn validate_unique_fqdns(input: &CaddyInput) -> Result<(), CaddyError> {
+    let mut seen: HashSet<&str> =
+        HashSet::with_capacity(input.services.len() + input.login_sites.len());
+    for l in &input.login_sites {
+        let fqdn = l.fqdn.as_str();
+        if !seen.insert(fqdn) {
+            return Err(CaddyError::DuplicateFqdn {
+                fqdn: fqdn.to_owned(),
+            });
+        }
+    }
+    for s in &input.services {
         let fqdn = s.fqdn.as_str();
         if !seen.insert(fqdn) {
             return Err(CaddyError::DuplicateFqdn {
@@ -65,14 +76,18 @@ fn render_global_block(out: &mut String, input: &CaddyInput) {
     out.push_str("}\n");
 }
 
-fn render_login_site(out: &mut String, input: &CaddyInput) {
-    let fqdn = input.login_site.fqdn.as_str();
-    let upstream = &input.login_site.upstream;
+fn render_login_site(out: &mut String, login: &crate::model::LoginSiteConfig) {
+    let fqdn = login.fqdn.as_str();
+    let upstream = &login.upstream;
 
     out.push('\n');
-    out.push_str("# Login site (always public — tenant guests log in here).\n");
+    out.push_str("# Per-tenant login site (always public — tenant guests log in here).\n");
     let _ = writeln!(out, "{fqdn} {{");
-    let _ = writeln!(out, "{INDENT}reverse_proxy {upstream}");
+    // We preserve the original Host (`auth.<tenant>.<domain>`) when proxying
+    // upstream so the login service can derive the tenant from it.
+    let _ = writeln!(out, "{INDENT}reverse_proxy {upstream} {{");
+    let _ = writeln!(out, "{INDENT}{INDENT}header_up Host {{host}}");
+    let _ = writeln!(out, "{INDENT}}}");
     out.push_str("}\n");
 }
 
@@ -88,9 +103,6 @@ fn render_service_site(out: &mut String, input: &CaddyInput, service: &ServiceSi
         AuthPolicy::Public => {
             out.push_str("# Service site, public bypass.\n");
         }
-        AuthPolicy::None => {
-            out.push_str("# Service site, no edge auth.\n");
-        }
     }
 
     let _ = writeln!(out, "{fqdn} {{");
@@ -99,6 +111,13 @@ fn render_service_site(out: &mut String, input: &CaddyInput, service: &ServiceSi
         let auth_upstream = &input.auth_endpoint.upstream;
         let _ = writeln!(out, "{INDENT}forward_auth {auth_upstream} {{");
         let _ = writeln!(out, "{INDENT}{INDENT}uri /verify");
+        // Forward the original Host + URI so /verify can:
+        //   (a) derive the tenant from Host (`*.<tenant>.<domain>`),
+        //   (b) build a redirect-to-login URL pointing back at the original
+        //       request when the cookie is missing or invalid.
+        let _ = writeln!(out, "{INDENT}{INDENT}header_up X-Tuntun-Forwarded-Host {{host}}");
+        let _ = writeln!(out, "{INDENT}{INDENT}header_up X-Tuntun-Forwarded-Uri {{uri}}");
+        let _ = writeln!(out, "{INDENT}{INDENT}header_up X-Tuntun-Forwarded-Proto {{scheme}}");
         let _ = writeln!(
             out,
             "{INDENT}{INDENT}copy_headers X-Tuntun-Tenant X-Tuntun-Subject"
@@ -155,7 +174,7 @@ mod tests {
 
     fn sample_login() -> LoginSiteConfig {
         LoginSiteConfig {
-            fqdn: Fqdn::new("auth.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("auth.sweater.memorici.de").expect("valid fqdn"),
             upstream: "127.0.0.1:7090".into(),
         }
     }
@@ -164,7 +183,7 @@ mod tests {
         CaddyInput {
             global: sample_global(),
             auth_endpoint: sample_auth(),
-            login_site: sample_login(),
+            login_sites: vec![sample_login()],
             services: vec![],
         }
     }
@@ -177,8 +196,9 @@ mod tests {
         assert!(out.contains("email ops@memorici.de"));
         assert!(out.contains("output file /var/lib/tuntun/caddy.log"));
         assert!(out.contains("format json"));
-        assert!(out.contains("auth.memorici.de {"));
-        assert!(out.contains("reverse_proxy 127.0.0.1:7090"));
+        assert!(out.contains("auth.sweater.memorici.de {"));
+        assert!(out.contains("reverse_proxy 127.0.0.1:7090 {"));
+        assert!(out.contains("header_up Host {host}"));
         // No service sites yet.
         assert!(!out.contains("forward_auth"));
     }
@@ -187,27 +207,14 @@ mod tests {
     fn public_service_has_no_forward_auth() {
         let mut input = empty_input();
         input.services.push(ServiceSite {
-            fqdn: Fqdn::new("api.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("api.sweater.memorici.de").expect("valid fqdn"),
             upstream_port: ServicePort::new(9002).expect("valid port"),
             auth_policy: AuthPolicy::Public,
             health_check_path: None,
         });
         let out = render_caddyfile(&input).expect("render");
-        assert!(out.contains("api.memorici.de {"));
+        assert!(out.contains("api.sweater.memorici.de {"));
         assert!(out.contains("reverse_proxy 127.0.0.1:9002"));
-        assert!(!out.contains("forward_auth"));
-    }
-
-    #[test]
-    fn auth_policy_none_has_no_forward_auth() {
-        let mut input = empty_input();
-        input.services.push(ServiceSite {
-            fqdn: Fqdn::new("internal.memorici.de").expect("valid fqdn"),
-            upstream_port: ServicePort::new(9003).expect("valid port"),
-            auth_policy: AuthPolicy::None,
-            health_check_path: None,
-        });
-        let out = render_caddyfile(&input).expect("render");
         assert!(!out.contains("forward_auth"));
     }
 
@@ -215,15 +222,17 @@ mod tests {
     fn tenant_service_has_forward_auth_with_correct_upstream() {
         let mut input = empty_input();
         input.services.push(ServiceSite {
-            fqdn: Fqdn::new("blog.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("blog.sweater.memorici.de").expect("valid fqdn"),
             upstream_port: ServicePort::new(9001).expect("valid port"),
             auth_policy: AuthPolicy::Tenant,
             health_check_path: None,
         });
         let out = render_caddyfile(&input).expect("render");
-        assert!(out.contains("blog.memorici.de {"));
+        assert!(out.contains("blog.sweater.memorici.de {"));
         assert!(out.contains("forward_auth 127.0.0.1:7081 {"));
         assert!(out.contains("uri /verify"));
+        assert!(out.contains("header_up X-Tuntun-Forwarded-Host {host}"));
+        assert!(out.contains("header_up X-Tuntun-Forwarded-Uri {uri}"));
         assert!(out.contains("copy_headers X-Tuntun-Tenant X-Tuntun-Subject"));
         assert!(out.contains("reverse_proxy 127.0.0.1:9001"));
         // forward_auth must come before reverse_proxy.
@@ -233,9 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn multiple_login_sites_emit_one_block_each() {
+        let input = CaddyInput {
+            global: sample_global(),
+            auth_endpoint: sample_auth(),
+            login_sites: vec![
+                LoginSiteConfig {
+                    fqdn: Fqdn::new("auth.sweater.memorici.de").expect("valid fqdn"),
+                    upstream: "127.0.0.1:7090".into(),
+                },
+                LoginSiteConfig {
+                    fqdn: Fqdn::new("auth.jm.memorici.de").expect("valid fqdn"),
+                    upstream: "127.0.0.1:7090".into(),
+                },
+            ],
+            services: vec![],
+        };
+        let out = render_caddyfile(&input).expect("render");
+        assert!(out.contains("auth.sweater.memorici.de {"));
+        assert!(out.contains("auth.jm.memorici.de {"));
+    }
+
+    #[test]
     fn duplicate_fqdns_rejected() {
         let mut input = empty_input();
-        let fqdn = Fqdn::new("blog.memorici.de").expect("valid fqdn");
+        let fqdn = Fqdn::new("blog.sweater.memorici.de").expect("valid fqdn");
         input.services.push(ServiceSite {
             fqdn: fqdn.clone(),
             upstream_port: ServicePort::new(9001).expect("valid port"),
@@ -252,7 +283,7 @@ mod tests {
         assert_eq!(
             err,
             CaddyError::DuplicateFqdn {
-                fqdn: "blog.memorici.de".into(),
+                fqdn: "blog.sweater.memorici.de".into(),
             }
         );
     }
@@ -261,7 +292,7 @@ mod tests {
     fn health_check_round_trip() {
         let mut input = empty_input();
         input.services.push(ServiceSite {
-            fqdn: Fqdn::new("svc.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("svc.sweater.memorici.de").expect("valid fqdn"),
             upstream_port: ServicePort::new(9100).expect("valid port"),
             auth_policy: AuthPolicy::Public,
             health_check_path: Some("/_health".into()),
@@ -276,13 +307,13 @@ mod tests {
     fn deterministic_across_calls() {
         let mut input = empty_input();
         input.services.push(ServiceSite {
-            fqdn: Fqdn::new("blog.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("blog.sweater.memorici.de").expect("valid fqdn"),
             upstream_port: ServicePort::new(9001).expect("valid port"),
             auth_policy: AuthPolicy::Tenant,
             health_check_path: None,
         });
         input.services.push(ServiceSite {
-            fqdn: Fqdn::new("api.memorici.de").expect("valid fqdn"),
+            fqdn: Fqdn::new("api.sweater.memorici.de").expect("valid fqdn"),
             upstream_port: ServicePort::new(9002).expect("valid port"),
             auth_policy: AuthPolicy::Public,
             health_check_path: Some("/healthz".into()),
@@ -297,16 +328,16 @@ mod tests {
         let input = CaddyInput {
             global: sample_global(),
             auth_endpoint: sample_auth(),
-            login_site: sample_login(),
+            login_sites: vec![sample_login()],
             services: vec![
                 ServiceSite {
-                    fqdn: Fqdn::new("blog.memorici.de").expect("valid fqdn"),
+                    fqdn: Fqdn::new("blog.sweater.memorici.de").expect("valid fqdn"),
                     upstream_port: ServicePort::new(9001).expect("valid port"),
                     auth_policy: AuthPolicy::Tenant,
                     health_check_path: None,
                 },
                 ServiceSite {
-                    fqdn: Fqdn::new("api.memorici.de").expect("valid fqdn"),
+                    fqdn: Fqdn::new("api.sweater.memorici.de").expect("valid fqdn"),
                     upstream_port: ServicePort::new(9002).expect("valid port"),
                     auth_policy: AuthPolicy::Public,
                     health_check_path: None,
@@ -324,22 +355,27 @@ mod tests {
     }
 }
 
-# Login site (always public — tenant guests log in here).
-auth.memorici.de {
-    reverse_proxy 127.0.0.1:7090
+# Per-tenant login site (always public — tenant guests log in here).
+auth.sweater.memorici.de {
+    reverse_proxy 127.0.0.1:7090 {
+        header_up Host {host}
+    }
 }
 
 # Service site with tenant auth.
-blog.memorici.de {
+blog.sweater.memorici.de {
     forward_auth 127.0.0.1:7081 {
         uri /verify
+        header_up X-Tuntun-Forwarded-Host {host}
+        header_up X-Tuntun-Forwarded-Uri {uri}
+        header_up X-Tuntun-Forwarded-Proto {scheme}
         copy_headers X-Tuntun-Tenant X-Tuntun-Subject
     }
     reverse_proxy 127.0.0.1:9001
 }
 
 # Service site, public bypass.
-api.memorici.de {
+api.sweater.memorici.de {
     reverse_proxy 127.0.0.1:9002
 }
 ";

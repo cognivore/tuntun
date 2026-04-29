@@ -2,7 +2,7 @@
 //! Porkbun JSON API. No I/O, no clocks, no randomness.
 
 use tuntun_core::{
-    DnsRecordKind, DnsRecordSpec, Domain, HttpMethod, HttpRequest, HttpUrl, Subdomain, Ttl,
+    DnsName, DnsRecordKind, DnsRecordSpec, Domain, HttpMethod, HttpRequest, HttpUrl, Ttl,
 };
 
 use crate::error::DnsError;
@@ -43,7 +43,7 @@ fn extract_auth(creds: &PorkbunCreds) -> Result<(&str, &str), DnsError> {
 pub fn build_list_request(
     creds: &PorkbunCreds,
     domain: &Domain,
-    name: &Subdomain,
+    name: &DnsName,
     kind: DnsRecordKind,
 ) -> Result<HttpRequest, DnsError> {
     let (apikey, secretapikey) = extract_auth(creds)?;
@@ -112,7 +112,7 @@ pub fn build_update_request(
 pub fn build_delete_request(
     creds: &PorkbunCreds,
     domain: &Domain,
-    name: &Subdomain,
+    name: &DnsName,
     kind: DnsRecordKind,
 ) -> Result<HttpRequest, DnsError> {
     let (apikey, secretapikey) = extract_auth(creds)?;
@@ -157,7 +157,7 @@ mod tests {
         let req = build_list_request(
             &creds(),
             &Domain::new("example.com").unwrap(),
-            &Subdomain::new("blog").unwrap(),
+            &DnsName::new("blog").unwrap(),
             DnsRecordKind::A,
         )
         .unwrap();
@@ -177,7 +177,7 @@ mod tests {
     fn create_request_serializes_a_record() {
         let spec = DnsRecordSpec {
             apex: Domain::new("memorici.de").unwrap(),
-            name: Subdomain::new("blog").unwrap(),
+            name: DnsName::new("blog").unwrap(),
             ttl: Ttl::new(60).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(203, 0, 113, 9),
@@ -196,7 +196,7 @@ mod tests {
     fn create_request_serializes_cname() {
         let spec = DnsRecordSpec {
             apex: Domain::new("memorici.de").unwrap(),
-            name: Subdomain::new("api").unwrap(),
+            name: DnsName::new("api").unwrap(),
             ttl: Ttl::new(300).unwrap(),
             content: DnsRecordContent::Cname {
                 target: Fqdn::new("edge.memorici.de").unwrap(),
@@ -213,7 +213,7 @@ mod tests {
     fn update_request_omits_name_field() {
         let spec = DnsRecordSpec {
             apex: Domain::new("memorici.de").unwrap(),
-            name: Subdomain::new("blog").unwrap(),
+            name: DnsName::new("blog").unwrap(),
             ttl: Ttl::new(120).unwrap(),
             content: DnsRecordContent::A {
                 ip: Ipv4Addr::new(1, 2, 3, 4),
@@ -232,7 +232,7 @@ mod tests {
         let req = build_delete_request(
             &creds(),
             &Domain::new("memorici.de").unwrap(),
-            &Subdomain::new("blog").unwrap(),
+            &DnsName::new("blog").unwrap(),
             DnsRecordKind::Cname,
         )
         .unwrap();
