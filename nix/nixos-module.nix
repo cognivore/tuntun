@@ -122,11 +122,41 @@ let
       bastionAuthorizedKeysLines + lib.optionalString (bastionAuthorizedKeysLines != "") "\n"
     );
 
-  # OpenSSH's AuthorizedKeysCommand demands a single binary that prints the
-  # authorized_keys lines on stdout. We hand it `cat <file>`.
-  bastionAuthorizedKeysScript = pkgs.writeShellScript "tuntun-bastion-keys" ''
-    exec ${pkgs.coreutils}/bin/cat ${bastionAuthorizedKeysFile}
-  '';
+  # Per-tenant runtime bless-key prefix the script wraps each
+  # `<state_dir>/tenants/<id>/bless.keys` line with. Same shape as the
+  # static `formatBastionLine` so a runtime-blessed key is treated
+  # identically to a NixOS-declared one.
+  blessKeyPrefix = tName:
+    ''command="${serverPkg}/bin/tuntun-server tcp-forward ${tName}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc'';
+
+  # OpenSSH's AuthorizedKeysCommand demands a single binary that prints
+  # the authorized_keys lines on stdout. The script first emits the static
+  # NixOS-declared keys, then for each tenant reads
+  # `<state_dir>/tenants/<id>/bless.keys` (lines like
+  # `ssh-ed25519 <body> <label>`) and emits each prefixed with the same
+  # `command="tuntun-server tcp-forward <id>"` clause. This is what makes
+  # `tuntun bless` land effective without a redeploy: AuthorizedKeysCommand
+  # is invoked fresh on every SSH attempt, so the file is re-read each time.
+  bastionAuthorizedKeysScript = pkgs.writeShellScript "tuntun-bastion-keys" (
+    ''
+      set -eu
+      ${pkgs.coreutils}/bin/cat ${bastionAuthorizedKeysFile}
+    ''
+    + lib.concatStrings (
+      lib.mapAttrsToList
+        (tName: _: ''
+          bless="${cfg.stateDir}/tenants/${tName}/bless.keys"
+          if [ -r "$bless" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in '#'*) continue;; esac
+              printf '%s %s\n' '${blessKeyPrefix tName}' "$line"
+            done < "$bless"
+          fi
+        '')
+        cfg.tenants
+    )
+  );
 in
 {
   options.services.tuntun-server = {

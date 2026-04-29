@@ -109,6 +109,17 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Authorize a new bastion-jump key for this tenant on a remote
+    /// machine. Generates a fresh ed25519 keypair, ships the private half
+    /// (and an SSH config block) to `user@host` over your existing SSH
+    /// access, and tells the server to accept the public half. After
+    /// this completes, `ssh ssh.tenant.domain` from `user@host` reaches
+    /// the laptop's local sshd through the tunnel.
+    Bless {
+        /// SSH target, e.g. `me@my-other-laptop`.
+        target: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -150,6 +161,9 @@ fn main() -> ExitCode {
             }
             Command::Whoami => commands::whoami::run(cli.config.as_deref()).await,
             Command::Inspect { path } => commands::inspect::run(&path).await,
+            Command::Bless { target } => {
+                commands::bless::run(&target, cli.config.as_deref()).await
+            }
         }
     });
 

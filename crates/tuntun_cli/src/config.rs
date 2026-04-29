@@ -32,6 +32,14 @@ pub struct DaemonConfig {
     /// pipes inbound bastion connections here. Default 22.
     #[serde(default = "default_ssh_local_port")]
     pub ssh_local_port: u16,
+    /// Apex domain published by `tuntun-server` (e.g. `fere.me`). Required
+    /// when `server_host` is an IP — otherwise we can't derive the
+    /// per-tenant FQDN (`ssh.<tenant>.<server_domain>`) that `tuntun bless`
+    /// writes into the remote's `~/.ssh/tuntun.config`. The home-manager
+    /// module sets it from `services.tuntun-cli.bastion.serverDomain`.
+    /// Empty string means "infer from server_host" (best-effort).
+    #[serde(default)]
+    pub server_domain: String,
 }
 
 fn default_private_key_secret_name() -> String {
@@ -115,5 +123,6 @@ fn parse_minimal_toml(bytes: &[u8]) -> Result<DaemonConfig> {
             .transpose()
             .map_err(|e| anyhow!("ssh_local_port: {e}"))?
             .unwrap_or_else(default_ssh_local_port),
+        server_domain: map.get("server_domain").cloned().unwrap_or_default(),
     })
 }

@@ -35,6 +35,7 @@ let
     state_dir = "${cfg.stateDir}"
     private_key_secret_name = "${cfg.privateKeySecretName}"
     ssh_local_port = "${toString cfg.bastion.sshLocalPort}"
+    server_domain = "${cfg.bastion.serverDomain}"
   '';
 
   bastionHostName = "ssh.${cfg.defaultTenant}.${cfg.bastion.serverDomain}";

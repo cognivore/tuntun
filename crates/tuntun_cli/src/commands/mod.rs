@@ -1,3 +1,4 @@
+pub mod bless;
 pub mod daemon;
 pub mod deregister;
 pub mod inspect;

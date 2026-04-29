@@ -72,6 +72,14 @@ pub enum ControlFrame {
     /// and pipe it to the appropriate local socket (e.g., `127.0.0.1:22` for
     /// [`BuiltinService::Ssh`]).
     StreamOpenBuiltin(StreamOpenBuiltinFrame),
+
+    /// Client -> Server. Authorize a new public key against the connecting
+    /// tenant's bastion at runtime, without a NixOS rebuild. The server
+    /// appends the key to `<state_dir>/tenants/<tenant>/bless.keys`, which
+    /// the bastion's `AuthorizedKeysCommand` reads on every SSH attempt.
+    BlessKey(BlessKeyFrame),
+    /// Server -> Client. Outcome of a [`BlessKeyFrame`].
+    BlessKeyAck(BlessKeyAckFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -350,4 +358,26 @@ pub struct StreamOpenBuiltinFrame {
     pub stream_id: u32,
     /// Which built-in service the stream is for.
     pub kind: BuiltinService,
+}
+
+// ---------------------------------------------------------------------------
+// Runtime bastion-key blessings (`tuntun bless`)
+// ---------------------------------------------------------------------------
+
+/// Client -> Server: authorize `public_key` against the bastion for the
+/// session's tenant. The label is a free-form human-readable identifier
+/// (typically `user@host`) that the server writes alongside the key in
+/// `bless.keys` so an operator can later spot what each entry is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlessKeyFrame {
+    pub public_key: Ed25519PublicKey,
+    pub label: String,
+}
+
+/// Server -> Client: result of a [`BlessKeyFrame`]. `ok = true` means the
+/// key has been appended to `bless.keys` and is live for new SSH attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlessKeyAckFrame {
+    pub ok: bool,
+    pub message: Option<String>,
 }

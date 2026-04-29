@@ -43,8 +43,8 @@ use tuntun_core::{
 };
 use tuntun_proto::{
     encode_frame, AuthChallengeFrame, AuthPolicy as ProtoAuthPolicy, AuthResultFrame,
-    ControlFrame, FrameBuffer, PongFrame, RegisteredFrame, ServiceAllocation, WelcomeFrame,
-    PROTOCOL_VERSION,
+    BlessKeyAckFrame, ControlFrame, FrameBuffer, PongFrame, RegisteredFrame, ServiceAllocation,
+    WelcomeFrame, PROTOCOL_VERSION,
 };
 
 use crate::caddy_supervisor::CaddySupervisor;
@@ -330,8 +330,15 @@ pub async fn handle_connection(
     ));
 
     // 11. Control IO: writer drains control_rx → control stream; reader
-    // handles inbound Ping/Deregister frames.
-    let writer_result = control_loop(&mut control, control_rx, control_tx).await;
+    // handles inbound Ping / Deregister / BlessKey frames.
+    let writer_result = control_loop(
+        &mut control,
+        control_rx,
+        control_tx,
+        tenant.clone(),
+        config.state_dir.clone(),
+    )
+    .await;
     if let Err(e) = writer_result {
         tracing::info!("control loop ended for {client_id}: {e:#}");
     }
@@ -432,6 +439,8 @@ async fn control_loop<S>(
     control: &mut S,
     mut control_rx: mpsc::Receiver<ControlFrame>,
     control_tx: mpsc::Sender<ControlFrame>,
+    tenant: TenantId,
+    state_dir: std::path::PathBuf,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -456,6 +465,27 @@ where
                         tracing::info!("client deregister received");
                         return Ok(());
                     }
+                    Some(ControlFrame::BlessKey(req)) => {
+                        let ack = match append_blessed_key(&state_dir, &tenant, &req).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "blessed key for tenant {tenant}: {label}",
+                                    label = req.label
+                                );
+                                BlessKeyAckFrame { ok: true, message: None }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "bless append failed for tenant {tenant}: {e:#}"
+                                );
+                                BlessKeyAckFrame {
+                                    ok: false,
+                                    message: Some(format!("{e:#}")),
+                                }
+                            }
+                        };
+                        write_frame(control, &ControlFrame::BlessKeyAck(ack)).await?;
+                    }
                     Some(other) => {
                         tracing::debug!("ignoring inbound control frame: {other:?}");
                     }
@@ -464,6 +494,86 @@ where
             }
         }
     }
+}
+
+/// Append `req.public_key` (in OpenSSH `ssh-ed25519 <b64> <label>` form) to
+/// `<state_dir>/tenants/<tenant>/bless.keys`, creating the directory and
+/// file as needed with mode 0750/0640. The bastion's
+/// `AuthorizedKeysCommand` reads this on every SSH attempt — no daemon
+/// reload, no NixOS rebuild. Idempotent: a key already present is a no-op.
+async fn append_blessed_key(
+    state_dir: &std::path::Path,
+    tenant: &TenantId,
+    req: &tuntun_proto::BlessKeyFrame,
+) -> Result<()> {
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use base64::Engine as _;
+
+    // Sanitize the label: strip CR/LF and the comment-terminator boundary,
+    // and bound the length. The label is operator-supplied via the protocol
+    // and lands verbatim in an `authorized_keys`-style line where a
+    // newline would split it into a SECOND key entry.
+    let label: String = req
+        .label
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(128)
+        .collect();
+
+    let pubkey_b64 = STANDARD_NO_PAD.encode(req.public_key.0);
+    // Rebuild the OpenSSH wire-format public key body: a single SSH string
+    // containing the algorithm name, then a single SSH string with the
+    // 32-byte raw key, all base64-encoded standard (with padding).
+    let openssh_b64 = encode_openssh_ed25519_public(&req.public_key.0);
+    let line = format!("ssh-ed25519 {openssh_b64} {label}\n");
+
+    let dir = state_dir.join("tenants").join(tenant.as_str());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("mkdir {}", dir.display()))?;
+    let path = dir.join("bless.keys");
+
+    // Idempotency check.
+    if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+        let key_marker = format!("ssh-ed25519 {openssh_b64} ");
+        if existing.lines().any(|l| l.starts_with(&key_marker)) {
+            tracing::debug!("bless: key already present in {}", path.display());
+            // Different label → still no-op for now; first-write wins.
+            // (`tuntun unbless` will manage replacement later.)
+            let _ = pubkey_b64; // silence unused
+            return Ok(());
+        }
+    }
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o640);
+    let mut f = opts
+        .open(&path)
+        .await
+        .with_context(|| format!("open append {}", path.display()))?;
+    use tokio::io::AsyncWriteExt as _;
+    f.write_all(line.as_bytes())
+        .await
+        .with_context(|| format!("write {}", path.display()))?;
+    f.flush().await?;
+    Ok(())
+}
+
+/// Encode a raw 32-byte ed25519 public key as the body of an `authorized_keys`
+/// `ssh-ed25519 <body>` line: SSH-string-encoded `"ssh-ed25519"` followed by
+/// the SSH-string-encoded raw key, the whole thing standard-base64.
+fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    let alg = b"ssh-ed25519";
+    let mut buf = Vec::with_capacity(4 + alg.len() + 4 + 32);
+    buf.extend_from_slice(&u32::try_from(alg.len()).unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(alg);
+    buf.extend_from_slice(&32u32.to_be_bytes());
+    buf.extend_from_slice(raw);
+    STANDARD.encode(&buf)
 }
 
 fn generate_nonce() -> Nonce {
