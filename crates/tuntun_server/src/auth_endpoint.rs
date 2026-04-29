@@ -156,11 +156,22 @@ pub struct LogoutForm {
 
 pub fn router(state: Arc<AuthState>) -> Router {
     Router::new()
+        .route("/", get(root_redirect))
         .route("/verify", get(verify))
         .route("/login", get(login_get).post(login_post))
         .route("/logout", post(logout_post))
         .route("/healthz", get(healthz))
         .with_state(state)
+}
+
+/// `GET /` on the per-tenant login host: a stray bare visit (typed URL,
+/// stale bookmark, follow-on after a logout) lands here. Bounce to
+/// `/login` so the user sees a useful page instead of a 404.
+async fn root_redirect() -> impl IntoResponse {
+    use axum::http::header::{HeaderValue, LOCATION};
+    let mut hdrs = HeaderMap::new();
+    hdrs.insert(LOCATION, HeaderValue::from_static("/login"));
+    (StatusCode::FOUND, hdrs, "")
 }
 
 pub async fn serve(addr: &str, state: Arc<AuthState>) -> Result<()> {
@@ -391,7 +402,11 @@ async fn login_post(
 
     use axum::http::header::{HeaderValue, LOCATION, SET_COOKIE};
     let mut hdrs = HeaderMap::new();
-    let location = sanitize_redirect(form.redirect.as_deref().unwrap_or("/"));
+    let location = sanitize_redirect(
+        form.redirect.as_deref().unwrap_or("/"),
+        &tenant,
+        &state.config.domain,
+    );
     if let Ok(v) = HeaderValue::from_str(&location) {
         hdrs.insert(LOCATION, v);
     }
@@ -539,13 +554,43 @@ fn extract_tenant_from_host(host: &str, server_domain: &str) -> Option<TenantId>
     TenantId::new(last.to_string()).ok()
 }
 
-/// Reject anything that isn't a server-relative path. Defense against
-/// open-redirect via `?redirect=https://evil/`.
-fn sanitize_redirect(s: &str) -> String {
+/// Decide what `Location:` to send the browser to after a successful
+/// login. Two shapes are accepted; everything else falls back to `/login`
+/// on the current login host.
+///
+/// 1. **Server-relative path** (`^/[^/]`): used verbatim. This is the
+///    legitimate "logged in, now go to the dashboard at this same host"
+///    case. We forbid `//host/...` because browsers parse those as
+///    scheme-relative URLs that change the host.
+/// 2. **Absolute URL inside the same tenant subtree**: the URL the user
+///    was originally trying to reach, carried through the login flow as
+///    `?redirect=https://blog.<tenant>.<domain>/...`. We accept it iff
+///    its scheme is `https://` and its host is `<anything>.<tenant>.
+///    <domain>` (or the tenant's own apex `<tenant>.<domain>`). Anything
+///    else — bare IP, a different tenant, a different domain entirely —
+///    is treated as an open-redirect attempt and discarded.
+fn sanitize_redirect(s: &str, tenant: &TenantId, server_domain: &str) -> String {
+    let fallback = "/login".to_string();
+    if s.is_empty() {
+        return fallback;
+    }
     if s.starts_with('/') && !s.starts_with("//") {
+        return s.to_string();
+    }
+    let Some(rest) = s.strip_prefix("https://") else {
+        return fallback;
+    };
+    let (host, _path) = rest.split_once('/').unwrap_or((rest, ""));
+    // Strip optional `:port`. The tenant subtree never carries non-default
+    // ports for tuntun-served URLs, but tolerate them rather than
+    // user-confusingly drop a redirect.
+    let host = host.split(':').next().unwrap_or(host);
+    let tenant_root = format!("{tenant}.{server_domain}");
+    let tenant_suffix = format!(".{tenant}.{server_domain}");
+    if host == tenant_root || host.ends_with(&tenant_suffix) {
         s.to_string()
     } else {
-        "/".to_string()
+        fallback
     }
 }
 
@@ -704,10 +749,48 @@ mod tests {
 
     #[test]
     fn sanitize_redirect_blocks_external() {
-        assert_eq!(sanitize_redirect("/dashboard"), "/dashboard");
-        assert_eq!(sanitize_redirect("https://evil/"), "/");
-        assert_eq!(sanitize_redirect("//evil/"), "/");
-        assert_eq!(sanitize_redirect("javascript:alert(1)"), "/");
+        let t = TenantId::new("sweater").expect("tenant");
+        let d = "fere.me";
+        // Server-relative paths: passed through.
+        assert_eq!(sanitize_redirect("/dashboard", &t, d), "/dashboard");
+        assert_eq!(sanitize_redirect("/", &t, d), "/");
+        // Same-tenant absolute URLs: passed through (the legitimate case
+        // for "log in then bounce back to the protected service URL").
+        assert_eq!(
+            sanitize_redirect("https://zensurance.sweater.fere.me/", &t, d),
+            "https://zensurance.sweater.fere.me/"
+        );
+        assert_eq!(
+            sanitize_redirect("https://blog.sweater.fere.me/posts/1", &t, d),
+            "https://blog.sweater.fere.me/posts/1"
+        );
+        // Tenant's own apex.
+        assert_eq!(
+            sanitize_redirect("https://sweater.fere.me/", &t, d),
+            "https://sweater.fere.me/"
+        );
+        // Cross-tenant absolute: rejected.
+        assert_eq!(
+            sanitize_redirect("https://blog.othertenant.fere.me/", &t, d),
+            "/login"
+        );
+        // Different domain entirely: rejected.
+        assert_eq!(sanitize_redirect("https://evil.com/", &t, d), "/login");
+        // Scheme-relative trickery: rejected.
+        assert_eq!(sanitize_redirect("//evil.com/", &t, d), "/login");
+        // Non-https scheme: rejected.
+        assert_eq!(sanitize_redirect("javascript:alert(1)", &t, d), "/login");
+        assert_eq!(
+            sanitize_redirect("http://zensurance.sweater.fere.me/", &t, d),
+            "/login"
+        );
+        // Empty: fallback.
+        assert_eq!(sanitize_redirect("", &t, d), "/login");
+        // Sneaky suffix-confusion: NOT same tenant.
+        assert_eq!(
+            sanitize_redirect("https://evilsweater.fere.me/", &t, d),
+            "/login"
+        );
     }
 
     #[test]
