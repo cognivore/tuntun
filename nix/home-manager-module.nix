@@ -186,8 +186,12 @@ in
           ThrottleInterval = 5;
           StandardOutPath = "${cfg.stateDir}/daemon.stdout.log";
           StandardErrorPath = "${cfg.stateDir}/daemon.stderr.log";
+          # The daemon shells out to `rageveil` to load the tunnel private
+          # key. launchd starts agents with a minimal PATH that doesn't
+          # include the user's nix profile, so we inject one explicitly.
           EnvironmentVariables = {
             RUST_LOG = "info,tuntun_cli=debug";
+            PATH = "${config.home.profileDirectory}/bin:/usr/local/bin:/usr/bin:/bin";
           };
         };
       };
@@ -203,7 +207,12 @@ in
           ExecStart = daemonExec;
           Restart = "on-failure";
           RestartSec = "2s";
-          Environment = [ "RUST_LOG=info,tuntun_cli=debug" ];
+          # Same rationale as the launchd agent above: ensure `rageveil`
+          # (and friends installed via home-manager) are reachable.
+          Environment = [
+            "RUST_LOG=info,tuntun_cli=debug"
+            "PATH=${config.home.profileDirectory}/bin:/usr/local/bin:/usr/bin:/bin"
+          ];
         };
         Install = {
           WantedBy = [ "default.target" ];
