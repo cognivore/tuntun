@@ -3,26 +3,35 @@
 //!
 //! Flow:
 //!
-//! 1. Generate a fresh ed25519 keypair locally (ephemeral; we don't keep
-//!    a copy — the remote owns it now, the server will accept it via
-//!    `bless.keys`, the laptop never needs to know it again).
+//! 1. Generate a fresh ed25519 keypair locally (ephemeral; the laptop holds
+//!    it just long enough to ship the private half to the remote and authorize
+//!    the public half on both ends).
 //! 2. Open a one-shot tunnel session to `tuntun-server`, authenticated via
 //!    the same ed25519 tunnel key the daemon uses (loaded from rageveil).
 //!    Send a `BlessKey` control frame with the new public key + a
-//!    `user@host` label, await the `BlessKeyAck`.
-//! 3. SSH to `<user@host>` and install:
+//!    `user@host` label, await the `BlessKeyAck`. The server appends the
+//!    public key to `bless.keys`; the bastion's `AuthorizedKeysCommand`
+//!    wraps every line with a `command="tuntun-server tcp-forward …"` clause
+//!    so the key can only drive the bastion byte-pipe.
+//! 3. Append the public key (no forced command) to the laptop's own
+//!    `~/.ssh/authorized_keys`, tagged with the bless label so `unbless` can
+//!    remove it. The laptop side of the SSH session — a normal sshd login —
+//!    needs an authorized key independent of the bastion; this is it.
+//! 4. SSH to `<user@host>` and install:
 //!    - `~/.ssh/tuntun_<tenant>_ed25519` (mode 0600) — the private half.
 //!    - `~/.ssh/tuntun_<tenant>_ed25519.pub` (mode 0644) — the public half.
-//!    - A `Host ssh.<tenant>.<domain>` block in `~/.ssh/tuntun.config`,
-//!      idempotent.
+//!    - A `Host ssh.<tenant>.<domain>` block + a private bastion-jump alias
+//!      in `~/.ssh/tuntun.config`, idempotent. The destination block uses
+//!      `ProxyCommand` so the user's outer ssh negotiates SSH end-to-end with
+//!      the laptop's sshd; the bastion jump is a dumb byte pipe.
 //!    - An `Include ~/.ssh/tuntun.config` line in `~/.ssh/config`,
 //!      idempotent.
 //!
 //! Idempotency: re-running `bless` for the same `<user@host>` mints a
 //! new key, ships it, and authorizes it. The old key remains in
-//! `bless.keys` until you remove it via `tuntun unbless <user@host>`.
-//! That's deliberate — overlapping keys during rotation should not
-//! suddenly break in-flight SSH.
+//! `bless.keys` (and in the laptop's `authorized_keys`) until you remove it
+//! via `tuntun unbless <user@host>`. That's deliberate — overlapping keys
+//! during rotation should not suddenly break in-flight SSH.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +54,16 @@ pub async fn run(target: &str, config: Option<&Path>) -> Result<()> {
     let tenant = TenantId::new(cfg.default_tenant.clone())
         .map_err(|e| anyhow!("invalid default_tenant: {e}"))?;
     let domain = resolve_domain(&cfg)?;
+
+    // The remote-side Host block needs to know which user on the laptop the
+    // inner SSH session should log in as. We use whoever is running tuntun
+    // — the same person who'll be sshing back to themselves later.
+    let laptop_user = std::env::var("USER").map_err(|_| {
+        anyhow!("USER env var not set; cannot determine the laptop user for the bless config")
+    })?;
+    if laptop_user.is_empty() {
+        bail!("USER env var is empty; cannot determine the laptop user for the bless config");
+    }
 
     // 1. Mint a fresh ed25519 keypair. Lives on the stack; we ship it via
     // SCP and let the local copy drop at end of scope. The server will
@@ -86,8 +105,25 @@ pub async fn run(target: &str, config: Option<&Path>) -> Result<()> {
     }
     session.close();
 
-    // 3. SSH to the remote and drop the files.
-    install_on_remote(target, &tenant, &domain, bless_pem.as_str(), &openssh_line).await?;
+    // 3. Authorize the same key on the laptop's local sshd. The bastion only
+    // proxies bytes; the inner SSH session is terminated by the laptop's own
+    // sshd, which needs to recognise the client key. Without this step,
+    // `ssh ssh.<tenant>.<domain>` from the remote would proxy through the
+    // bastion just to be rejected by the laptop with "Permission denied".
+    append_local_authorized_key(&label, &openssh_line)
+        .await
+        .context("authorize bless key on laptop's sshd")?;
+
+    // 4. SSH to the remote and drop the files.
+    install_on_remote(
+        target,
+        &tenant,
+        &domain,
+        &laptop_user,
+        bless_pem.as_str(),
+        &openssh_line,
+    )
+    .await?;
 
     println!("blessed {target} for tenant {tenant}: ssh ssh.{tenant}.{domain}");
     Ok(())
@@ -143,19 +179,36 @@ async fn install_on_remote(
     target: &str,
     tenant: &TenantId,
     domain: &str,
+    laptop_user: &str,
     private_pem: &str,
     public_openssh_line: &str,
 ) -> Result<()> {
     let key_basename = format!("tuntun_{}_ed25519", tenant.as_str());
     let host_alias = format!("ssh.{tenant}.{domain}");
+    // Private alias used as a ProxyCommand stepping stone. Distinct from
+    // `host_alias` so the inner ssh invocation doesn't recursively match
+    // the outer `Host ssh.<tenant>.<domain>` block. Both names are covered
+    // by the `*.<tenant>.<domain>` wildcard A record on Porkbun.
+    let bastion_alias = format!("_tuntun_bastion_{tenant}");
 
     // The remote receives this bash heredoc, runs it. It writes the key
-    // material with strict permissions, appends a Host block to
-    // `~/.ssh/tuntun.config` if not already present, and prepends an
-    // `Include ~/.ssh/tuntun.config` line to `~/.ssh/config` if missing.
+    // material with strict permissions, appends two Host blocks to
+    // `~/.ssh/tuntun.config` if not already present (one for the destination
+    // — used by the human as `ssh ssh.<tenant>.<domain>` — and one for the
+    // bastion jump, invoked via ProxyCommand from the first), and prepends
+    // an `Include ~/.ssh/tuntun.config` line to `~/.ssh/config` if missing.
     // We use `awk` checks so re-running for the same tenant is a no-op
     // on the config files (the key material is overwritten, since the
     // private key is fresh each time).
+    //
+    // Why ProxyCommand: the bastion sshd's `command="tuntun-server tcp-forward
+    // <tenant>",no-pty,…` forced command pumps stdin/stdout to a unix socket
+    // that's bridged through the tunnel into the laptop's local sshd. The
+    // outer ssh client must therefore speak SSH protocol *through* that pipe
+    // (so it negotiates directly with the laptop's sshd, preserving end-to-end
+    // SSH crypto). Connecting to the bastion directly would make the outer
+    // ssh treat the bastion as the SSH endpoint — which is exactly what fails
+    // with "PTY allocation request failed on channel 0".
     let script = format!(
         r#"set -eu
 mkdir -p ~/.ssh
@@ -176,10 +229,21 @@ if ! awk -v h='Host {host_alias}' '$0==h {{found=1}} END {{exit !found}}' ~/.ssh
 cat >> ~/.ssh/tuntun.config <<'__TUNTUN_CFG_EOF__'
 
 Host {host_alias}
-    User tuntun
-    Port 2222
+    HostName {host_alias}
+    User {laptop_user}
+    ProxyCommand ssh -T {bastion_alias}
     IdentityFile ~/.ssh/{key_basename}
     IdentitiesOnly yes
+
+Host {bastion_alias}
+    HostName {host_alias}
+    Port 2222
+    User tuntun
+    IdentityFile ~/.ssh/{key_basename}
+    IdentitiesOnly yes
+    RequestTTY no
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
 __TUNTUN_CFG_EOF__
 fi
 
@@ -227,4 +291,52 @@ fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
     buf.extend_from_slice(&32u32.to_be_bytes());
     buf.extend_from_slice(raw);
     STANDARD.encode(&buf)
+}
+
+/// Append the bless pubkey to the laptop's `~/.ssh/authorized_keys`, tagged
+/// with the bless label so `unbless` can locate and remove it. Idempotent:
+/// any existing line containing the same label is left in place.
+///
+/// We deliberately do not add a `command="..."` restriction here. The
+/// equivalent restriction lives only at the bastion — that's its whole
+/// purpose. The laptop endpoint is a normal interactive sshd login.
+async fn append_local_authorized_key(label: &str, openssh_line: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME env var not set"))?;
+    let ssh_dir = std::path::Path::new(&home).join(".ssh");
+    tokio::fs::create_dir_all(&ssh_dir)
+        .await
+        .with_context(|| format!("create {}", ssh_dir.display()))?;
+    // Tighten ssh dir perms if it was just created world-readable; harmless
+    // if already 0700.
+    let _ = tokio::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).await;
+
+    let auth_path = ssh_dir.join("authorized_keys");
+    let existing = match tokio::fs::read_to_string(&auth_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("read {}", auth_path.display()));
+        }
+    };
+
+    if existing.lines().any(|l| l.contains(label)) {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(openssh_line);
+
+    tokio::fs::write(&auth_path, updated.as_bytes())
+        .await
+        .with_context(|| format!("write {}", auth_path.display()))?;
+    tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("chmod 600 {}", auth_path.display()))?;
+    Ok(())
 }

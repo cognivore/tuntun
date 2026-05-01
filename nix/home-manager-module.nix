@@ -40,6 +40,12 @@ let
 
   bastionHostName = "ssh.${cfg.defaultTenant}.${cfg.bastion.serverDomain}";
 
+  # Private alias for the bastion-jump leg. Distinct from `bastionHostName`
+  # so the inner ssh invocation (the ProxyCommand) doesn't recursively match
+  # the outer destination block. Both names resolve via the same
+  # `*.<tenant>.<domain>` wildcard A record.
+  bastionJumpAlias = "_tuntun_bastion_${cfg.defaultTenant}";
+
   isDarwin = pkgs.stdenv.isDarwin;
 
   daemonExec = "${cliPkg}/bin/tuntun daemon --config ${daemonConfigToml}";
@@ -155,16 +161,41 @@ in
 
     (lib.mkIf cfg.bastion.enable {
       programs.ssh.enable = lib.mkDefault true;
+
+      # Destination block: this is what the user types as
+      # `ssh ssh.<tenant>.<domain>`. The outer ssh client speaks SSH protocol
+      # end-to-end with the laptop's local sshd; the bastion only proxies
+      # bytes via the jump alias below. `User` is the laptop's own login
+      # name because the inner sshd authenticates a normal interactive
+      # session.
       programs.ssh.matchBlocks."tuntun-bastion" = {
         host = bastionHostName;
-        hostname = cfg.bastion.serverDomain;
+        hostname = bastionHostName;
+        user = config.home.username;
+        proxyCommand = "ssh -T ${bastionJumpAlias}";
+        identityFile = lib.mkIf (cfg.bastion.identityFile != null) cfg.bastion.identityFile;
+        extraOptions = {
+          IdentitiesOnly = "yes";
+          ServerAliveInterval = "30";
+          ServerAliveCountMax = "3";
+        };
+      };
+
+      # Bastion-jump alias: invoked exclusively by the ProxyCommand above.
+      # The bastion sshd's `command="tuntun-server tcp-forward <tenant>"`
+      # forced command pumps stdin/stdout to the unix socket bridged into
+      # the tunnel — so this ssh's session-channel byte stream is what the
+      # outer ssh sees as a "TCP connection" to the laptop's sshd.
+      # `RequestTTY no` avoids the harmless "PTY allocation request failed"
+      # message; the forced command doesn't allocate one anyway.
+      programs.ssh.matchBlocks."tuntun-bastion-jump" = {
+        host = bastionJumpAlias;
+        hostname = bastionHostName;
         port = cfg.bastion.bastionPort;
         user = "tuntun";
         identityFile = lib.mkIf (cfg.bastion.identityFile != null) cfg.bastion.identityFile;
-        # The bastion's authorized_keys lines all carry a forced command,
-        # so OpenSSH won't open an interactive shell — these tweaks just
-        # avoid client-side warnings when that "command" runs to completion.
         extraOptions = {
+          IdentitiesOnly = "yes";
           RequestTTY = "no";
           ServerAliveInterval = "30";
           ServerAliveCountMax = "3";
