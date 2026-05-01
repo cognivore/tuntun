@@ -92,71 +92,83 @@ let
   # matching tenant. End-to-end SSH crypto is preserved because the bastion
   # only authenticates the *jump*; the inner SSH session is opaque.
   #
-  # The `tuntun-keys-line` helper rewrites our `ed25519:<base64>` key format
-  # into OpenSSH's `ssh-ed25519 <base64>` format, since that is what `sshd`
-  # expects.
-  # Render one OpenSSH `authorized_keys`-style line per (tenant, key). The
-  # leading `command="..."` clause locks the key to a single, parameterless
-  # invocation of our forwarder, so the bastion never sees the inner SSH
-  # session. Tenant identity is bound to the *key*, not to the SSH username.
-  formatBastionLine = tName: key:
-    if lib.hasPrefix "ed25519:" key
-    then
-      let dropped = lib.removePrefix "ed25519:" key; in
-      ''command="${serverPkg}/bin/tuntun-server tcp-forward ${tName}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 ${dropped} tuntun-bastion-${tName}''
-    else
-      # Pass-through for already-OpenSSH-formatted keys.
-      ''command="${serverPkg}/bin/tuntun-server tcp-forward ${tName}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc ${key}'';
+  # The script handles two flavors of authorized key per tenant:
+  #
+  #   1. Static keys from NixOS (`tenants.<id>.authorizedKeys`), which may
+  #      be in our compact `ed25519:<urlsafe-base64-of-raw-32-bytes>` form
+  #      (mirroring the laptop's tunnel pubkey) OR in OpenSSH's native
+  #      `ssh-ed25519 <wire-base64> [comment]` form. The compact form is
+  #      converted on the fly to OpenSSH wire format because sshd's
+  #      authorized_keys parser only understands the latter.
+  #   2. Runtime "bless" keys appended by `tuntun bless` to
+  #      `<state_dir>/tenants/<id>/bless.keys`, which are already in OpenSSH
+  #      format (the daemon writes them that way). AuthorizedKeysCommand is
+  #      invoked fresh on every SSH attempt, so newly-blessed keys land
+  #      without a NixOS rebuild.
+  bastionAuthorizedKeysScript = pkgs.writeShellScript "tuntun-bastion-keys" ''
+    set -eu
+    export PATH=${pkgs.coreutils}/bin
 
-  bastionAuthorizedKeysLines =
-    lib.concatStringsSep "\n" (
-      lib.flatten (
-        lib.mapAttrsToList
-          (tName: t: map (k: formatBastionLine tName k) t.authorizedKeys)
-          cfg.tenants
-      )
-    );
+    # Convert urlsafe-base64 of a raw 32-byte ed25519 public key into the
+    # OpenSSH wire-format base64 body: standard-base64 of
+    # (4-byte BE len=11 || "ssh-ed25519" || 4-byte BE len=32 || raw32).
+    to_openssh() {
+      local body="$1"
+      local std rem pad
+      std=$(printf '%s' "$body" | tr '_-' '/+')
+      rem=$(( ''${#std} % 4 ))
+      if [ "$rem" -gt 0 ]; then
+        pad=$(printf '%.s=' $(seq 1 $((4 - rem))))
+        std="$std$pad"
+      fi
+      {
+        printf '\x00\x00\x00\x0Bssh-ed25519\x00\x00\x00\x20'
+        printf '%s' "$std" | base64 -d
+      } | base64 -w0
+    }
 
-  bastionAuthorizedKeysFile =
-    pkgs.writeText "tuntun-bastion-authorized-keys" (
-      bastionAuthorizedKeysLines + lib.optionalString (bastionAuthorizedKeysLines != "") "\n"
-    );
+    emit_static() {
+      local tname="$1" key="$2"
+      local prefix
+      prefix="command=\"${serverPkg}/bin/tuntun-server --config ${configToml} tcp-forward $tname\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc"
+      case "$key" in
+        ed25519:*)
+          local body wire
+          body="''${key#ed25519:}"
+          wire=$(to_openssh "$body")
+          printf '%s ssh-ed25519 %s tuntun-bastion-%s\n' "$prefix" "$wire" "$tname"
+          ;;
+        *)
+          # Already-OpenSSH-formatted line: pass through.
+          printf '%s %s\n' "$prefix" "$key"
+          ;;
+      esac
+    }
 
-  # Per-tenant runtime bless-key prefix the script wraps each
-  # `<state_dir>/tenants/<id>/bless.keys` line with. Same shape as the
-  # static `formatBastionLine` so a runtime-blessed key is treated
-  # identically to a NixOS-declared one.
-  blessKeyPrefix = tName:
-    ''command="${serverPkg}/bin/tuntun-server tcp-forward ${tName}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc'';
+    ${lib.concatStrings (lib.mapAttrsToList (tName: t:
+      lib.concatMapStrings (k: ''
+        emit_static ${lib.escapeShellArg tName} ${lib.escapeShellArg k}
+      '') t.authorizedKeys
+    ) cfg.tenants)}
 
-  # OpenSSH's AuthorizedKeysCommand demands a single binary that prints
-  # the authorized_keys lines on stdout. The script first emits the static
-  # NixOS-declared keys, then for each tenant reads
-  # `<state_dir>/tenants/<id>/bless.keys` (lines like
-  # `ssh-ed25519 <body> <label>`) and emits each prefixed with the same
-  # `command="tuntun-server tcp-forward <id>"` clause. This is what makes
-  # `tuntun bless` land effective without a redeploy: AuthorizedKeysCommand
-  # is invoked fresh on every SSH attempt, so the file is re-read each time.
-  bastionAuthorizedKeysScript = pkgs.writeShellScript "tuntun-bastion-keys" (
-    ''
-      set -eu
-      ${pkgs.coreutils}/bin/cat ${bastionAuthorizedKeysFile}
-    ''
-    + lib.concatStrings (
-      lib.mapAttrsToList
-        (tName: _: ''
-          bless="${cfg.stateDir}/tenants/${tName}/bless.keys"
-          if [ -r "$bless" ]; then
-            while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              case "$line" in '#'*) continue;; esac
-              printf '%s %s\n' '${blessKeyPrefix tName}' "$line"
-            done < "$bless"
-          fi
-        '')
-        cfg.tenants
-    )
-  );
+    ${lib.concatStrings (lib.mapAttrsToList (tName: _: ''
+      bless=${lib.escapeShellArg "${cfg.stateDir}/tenants/${tName}/bless.keys"}
+      if [ -r "$bless" ]; then
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          case "$line" in '#'*) continue;; esac
+          printf 'command="${serverPkg}/bin/tuntun-server --config ${configToml} tcp-forward ${tName}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc %s\n' "$line"
+        done < "$bless"
+      fi
+    '') cfg.tenants)}
+  '';
+
+  # OpenSSH refuses to invoke an AuthorizedKeysCommand whose realpath
+  # ancestry is group/world-writable (the `safe_path` check in misc.c).
+  # `/nix/store` is mode 1775 root:nixbld, which fails that test, so we
+  # materialize the script at activation time into /var/lib (a chain of
+  # 0755 root:root directories) where sshd will accept it.
+  bastionAuthorizedKeysCommandPath = "/var/lib/tuntun-bastion-keys";
 in
 {
   options.services.tuntun-server = {
@@ -400,7 +412,7 @@ in
       extraConfig = ''
         Match LocalPort ${toString cfg.ssh.bastionPort} User tuntun
             AuthorizedKeysFile none
-            AuthorizedKeysCommand ${bastionAuthorizedKeysScript}
+            AuthorizedKeysCommand ${bastionAuthorizedKeysCommandPath}
             AuthorizedKeysCommandUser tuntun
             PasswordAuthentication no
             KbdInteractiveAuthentication no
@@ -411,6 +423,18 @@ in
             PermitOpen none
         Match all
       '';
+    };
+
+    # Materialize the bastion-keys script outside /nix/store so sshd's
+    # safe_path check accepts it. Re-runs on every nixos-rebuild and picks
+    # up changes to the tenant key set or the script body itself.
+    system.activationScripts.tuntunBastionKeys = lib.mkIf cfg.ssh.enable {
+      text = ''
+        install -m 0755 -o root -g root \
+          ${bastionAuthorizedKeysScript} \
+          ${bastionAuthorizedKeysCommandPath}
+      '';
+      deps = [ "users" ];
     };
   };
 }

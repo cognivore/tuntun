@@ -28,9 +28,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
+use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData};
+use ssh_key::{LineEnding, PrivateKey};
 use tokio::io::AsyncWriteExt;
 
 use tuntun_core::{Ed25519PublicKey, TenantId};
@@ -52,11 +52,21 @@ pub async fn run(target: &str, config: Option<&Path>) -> Result<()> {
     let bless_signing = SigningKey::generate(&mut rand::rngs::OsRng);
     let bless_pub = bless_signing.verifying_key();
     let bless_pub_wire = Ed25519PublicKey::from_bytes(bless_pub.to_bytes());
-    let bless_pem = bless_signing
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| anyhow!("encode bless key as PKCS#8 PEM: {e}"))?;
-    let openssh_b64 = encode_openssh_ed25519_public(&bless_pub.to_bytes());
     let label = format!("tuntun-bless-{tenant}-{target}");
+    // OpenSSH cannot reliably load PKCS#8 PEM private keys for ed25519 —
+    // ssh-keygen reports "invalid format" and the auth signing step fails
+    // silently. Encode in OpenSSH's own format instead, which is what
+    // ssh-keygen produces by default for ed25519.
+    let bless_keypair = Ed25519Keypair {
+        public: ssh_key::public::Ed25519PublicKey(bless_pub.to_bytes()),
+        private: Ed25519PrivateKey::from_bytes(&bless_signing.to_bytes()),
+    };
+    let bless_private = PrivateKey::new(KeypairData::Ed25519(bless_keypair), label.clone())
+        .map_err(|e| anyhow!("build OpenSSH private key: {e}"))?;
+    let bless_pem = bless_private
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| anyhow!("encode bless key as OpenSSH PEM: {e}"))?;
+    let openssh_b64 = encode_openssh_ed25519_public(&bless_pub.to_bytes());
     let openssh_line = format!("ssh-ed25519 {openssh_b64} {label}\n");
 
     // 2. One-shot tunnel session: authenticate, send BlessKey, get ack.
