@@ -13,7 +13,7 @@ use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tuntun_config::ProjectSpec;
@@ -36,8 +36,16 @@ use crate::tunnel::reconnect::BackoffState;
 
 const SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Map a yamux stream id to the local port it should be forwarded to.
-type StreamRouting = BTreeMap<u32, LocalPort>;
+/// Stream-routing state shared between the control loop (writer) and the
+/// yamux acceptor (reader). The `Notify` lets the acceptor block until a
+/// matching `StreamOpen` arrives, instead of busy-polling. It's wrapped
+/// in an `Arc` so the acceptor can clone it out from under the lock and
+/// await on it without holding the routing mutex.
+#[derive(Debug, Default)]
+struct StreamRouting {
+    map: BTreeMap<u32, LocalPort>,
+    notify: Arc<Notify>,
+}
 
 /// Snapshot of the projects the daemon should advertise to the server.
 #[derive(Debug, Clone, Default)]
@@ -50,6 +58,11 @@ pub struct TunnelClient {
     config: Arc<DaemonConfig>,
     state_dir: PathBuf,
     projects: Arc<tokio::sync::RwLock<ProjectsSnapshot>>,
+    /// Fires whenever `projects` is replaced. The active `run_session`
+    /// selects on this and returns when it changes, so the next iteration
+    /// of `run_forever` re-registers with the new spec — without needing
+    /// to wait for the old session to die naturally.
+    projects_changed: Arc<Notify>,
 }
 
 impl TunnelClient {
@@ -59,6 +72,7 @@ impl TunnelClient {
             config,
             state_dir,
             projects: Arc::new(tokio::sync::RwLock::new(ProjectsSnapshot::default())),
+            projects_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -66,11 +80,16 @@ impl TunnelClient {
         self.projects.clone()
     }
 
-    /// Replace the daemon's project list. Currently invoked only at startup;
-    /// future Unix-socket IPC will call this on each `tuntun register`.
+    /// Replace the daemon's project list. The active session is woken so
+    /// it tears down and re-registers with the new spec on next iteration.
     pub async fn update_projects(&self, snapshot: ProjectsSnapshot) {
         let mut guard = self.projects.write().await;
         *guard = snapshot;
+        drop(guard);
+        // notify_waiters wakes every current await on .notified(); future
+        // calls are not pre-armed (which is fine — we just need to wake the
+        // single live session).
+        self.projects_changed.notify_waiters();
     }
 
     /// Run the long-lived client loop. Returns only on fatal error
@@ -167,7 +186,7 @@ impl TunnelClient {
         // Spawn the driver — it owns yamux_conn outright and pumps inbound
         // streams. From here on the handshake task uses only `control`,
         // which is independent of `yamux_conn`'s ownership.
-        let routing: Arc<Mutex<StreamRouting>> = Arc::new(Mutex::new(StreamRouting::new()));
+        let routing: Arc<Mutex<StreamRouting>> = Arc::new(Mutex::new(StreamRouting::default()));
         let ssh_local_port = LocalPort::new(self.config.ssh_local_port)
             .map_err(|e| anyhow!("ssh_local_port {}: {e}", self.config.ssh_local_port))?;
         let routing_for_acceptor = routing.clone();
@@ -286,14 +305,24 @@ impl TunnelClient {
         // before the handshake; once Register completes the server is free
         // to open new inbound streams and the acceptor will pick them up
         // and pair each with a routing entry.
-        let control_loop_result = run_control_loop(
-            &mut control,
-            &mut control_inbox,
-            routing_seed,
-            ssh_local_port,
-            routing.clone(),
-        )
-        .await;
+        //
+        // We race the loop against `projects_changed` so a `tuntun register
+        // <new>` triggers a clean reconnect that picks up the fresh spec —
+        // without it the daemon only re-registers on its own boot.
+        let projects_changed = self.projects_changed.clone();
+        let control_loop_result = tokio::select! {
+            r = run_control_loop(
+                &mut control,
+                &mut control_inbox,
+                routing_seed,
+                ssh_local_port,
+                routing.clone(),
+            ) => r,
+            () = projects_changed.notified() => {
+                tracing::info!("projects snapshot changed; tearing down session to re-register");
+                Ok(())
+            }
+        };
 
         // Make sure the acceptor doesn't hold onto yamux past disconnect.
         acceptor.abort();
@@ -375,7 +404,8 @@ where
                 let key = (open.project.clone(), open.service.clone());
                 if let Some(port) = local_routing.get(&key) {
                     let mut r = routing.lock().await;
-                    r.insert(open.stream_id, *port);
+                    r.map.insert(open.stream_id, *port);
+                    r.notify.notify_waiters();
                 } else {
                     tracing::warn!(
                         "StreamOpen for unknown service {}/{}",
@@ -387,7 +417,8 @@ where
             ControlFrame::StreamOpenBuiltin(open) => match open.kind {
                 BuiltinService::Ssh => {
                     let mut r = routing.lock().await;
-                    r.insert(open.stream_id, ssh_local_port);
+                    r.map.insert(open.stream_id, ssh_local_port);
+                    r.notify.notify_waiters();
                     tracing::debug!(
                         "builtin ssh stream {} -> 127.0.0.1:{}",
                         open.stream_id,
@@ -419,20 +450,28 @@ async fn wait_for_routing(
     routing: &Arc<Mutex<StreamRouting>>,
     stream_id: u32,
 ) -> Option<LocalPort> {
-    // Poll the routing map for up to ~2s. The StreamOpen frame and the
-    // inbound yamux stream race; the frame is small so it usually arrives
-    // first, but we allow a brief retry window.
-    use std::time::Duration;
-    for _ in 0..200 {
-        {
-            let map = routing.lock().await;
-            if let Some(port) = map.get(&stream_id).copied() {
+    // The StreamOpen control frame and the inbound yamux stream race; the
+    // control frame is small and is usually processed first, but the
+    // control loop serializes (and may be busy writing a Pong reply, etc.).
+    // Wait for at most 10s, woken every time the control loop inserts a
+    // new route via `notify.notify_waiters`. Two seconds — the previous
+    // value — was inadequate when the control loop was momentarily blocked
+    // on a slow write.
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let notify = {
+            let r = routing.lock().await;
+            if let Some(port) = r.map.get(&stream_id).copied() {
                 return Some(port);
             }
+            r.notify.clone()
+        };
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if tokio::time::timeout(remaining, notify.notified()).await.is_err() {
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    None
 }
 
 async fn pump_stream_to_local(yamux_stream: yamux::Stream, port: LocalPort) -> Result<()> {

@@ -9,6 +9,8 @@ use tuntun_config::parse_project_spec_from_str;
 use crate::config::DaemonConfig;
 use crate::tunnel::client::{ProjectsSnapshot, TunnelClient};
 
+// Imports below kept for the unchanged `scan_projects_dir` helper.
+
 pub async fn run(config: Option<&Path>) -> Result<()> {
     let cfg = Arc::new(DaemonConfig::load(config).await?);
     tracing::info!(
@@ -24,10 +26,14 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     // a `tuntun_config::ProjectSpec`. The CLI's `register` subcommand drops
     // its specs there. We poll on a short interval — the `notify` crate's
     // backend would be preferable but in this initial cut we keep it simple.
-    let projects_handle = client.projects_handle();
+    //
+    // The watcher must call `client.update_projects` (not write the inner
+    // RwLock directly) because `update_projects` fires `projects_changed`,
+    // which is what wakes the live session for re-registration.
+    let client_for_watcher = client.clone();
     let projects_dir_for_watcher = projects_dir.clone();
     tokio::spawn(async move {
-        if let Err(e) = watch_projects(projects_dir_for_watcher, projects_handle).await {
+        if let Err(e) = watch_projects(projects_dir_for_watcher, client_for_watcher).await {
             tracing::warn!("project watcher exited: {e:#}");
         }
     });
@@ -37,7 +43,7 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
 
 async fn watch_projects(
     dir: std::path::PathBuf,
-    snapshot_handle: Arc<tokio::sync::RwLock<ProjectsSnapshot>>,
+    client: Arc<TunnelClient>,
 ) -> Result<()> {
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!("mkdir {} failed: {e}", dir.display());
@@ -50,9 +56,7 @@ async fn watch_projects(
         match scan_projects_dir(&dir).await {
             Ok((snapshot, mtimes)) => {
                 if mtimes != last_mtimes {
-                    let mut guard = snapshot_handle.write().await;
-                    *guard = snapshot;
-                    drop(guard);
+                    client.update_projects(snapshot).await;
                     last_mtimes = mtimes;
                     tracing::info!("project snapshot updated from {}", dir.display());
                 }
