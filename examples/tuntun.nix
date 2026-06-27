@@ -24,8 +24,10 @@ tuntun.mkProject {
   # Apex domain you own in Porkbun.
   domain = "memorici.de";
 
-  # Optional explicit project name (default: directory name of the flake).
-  # project = "my-app";
+  # Project name — the identity this registration is filed under. Naming it
+  # explicitly is the recommended way; omit it and the CLI falls back to this
+  # directory's name (never the tenant id).
+  project = "my-app";
 
   services = {
     blog = {

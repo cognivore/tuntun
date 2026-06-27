@@ -36,8 +36,11 @@ pub struct ProjectSpec {
     /// (e.g., `memorici.de`).
     pub domain: Domain,
 
-    /// Optional explicit project name. When absent, the CLI defaults to the
-    /// current working directory's name.
+    /// Project name — the identity its registration is filed under.
+    ///
+    /// Naming it explicitly is the canonical way. When absent, the CLI
+    /// defaults to the project *directory's* name (never the tenant id, which
+    /// would collide across a tenant's projects).
     #[serde(default)]
     pub project: Option<ProjectId>,
 
