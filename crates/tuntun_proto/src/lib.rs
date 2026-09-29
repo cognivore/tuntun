@@ -33,8 +33,9 @@ pub use frames::{
     AuthChallengeFrame, AuthPolicy, AuthRequestFrame, AuthResponseFrame, AuthResultFrame,
     BlessKeyAckFrame, BlessKeyFrame, BlessingEntry, BlessingsListFrame, BuiltinService,
     ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame, HealthCheckSpec, HelloFrame,
-    ListBlessingsFrame, PingFrame, PongFrame, ProjectRegistration, RegisterFrame,
-    RegisteredFrame, ServiceAllocation, ServiceRegistration, StreamCloseFrame, StreamCloseReason,
-    StreamDataFrame, StreamOpenBuiltinFrame, StreamOpenFrame, UnblessKeyAckFrame,
-    UnblessKeyFrame, WelcomeFrame, PROTOCOL_VERSION,
+    ListBlessingsFrame, PingFrame, PongFrame, ProjectRegistration, RegisterFrame, RegisteredFrame,
+    ServiceAllocation, ServiceRegistration, StreamCloseFrame, StreamCloseReason, StreamDataFrame,
+    StreamOpenBuiltinFrame, StreamOpenFrame, UnblessKeyAckFrame, UnblessKeyFrame, WelcomeFrame,
+    PROTOCOL_VERSION,
 };
+pub mod heartbeat;

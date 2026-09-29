@@ -32,7 +32,7 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     // Wire adapters.
     let http = Arc::new(ReqwestHttp::new()?);
     let secrets = CredentialDirSecrets;
-    let registry = Arc::new(Registry::new(20_000));
+    let registry = Arc::new(Registry::new());
     let supervisor = Arc::new(CaddySupervisor::new(cfg.clone()));
 
     // Load Porkbun creds via the credential-directory adapter.
@@ -69,49 +69,40 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
     let auth_state = Arc::new(AuthState::new(cfg.clone(), signing_key));
     let auth_listen = cfg.auth_listen.clone();
     let login_listen = cfg.login_listen.clone();
+    let mut workers = tokio::task::JoinSet::new();
     let auth_state_a = auth_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::auth_endpoint::serve(&auth_listen, auth_state_a).await {
-            tracing::error!("auth endpoint (auth_listen): {e:#}");
-        }
+    workers.spawn(async move {
+        crate::auth_endpoint::serve(&auth_listen, auth_state_a)
+            .await
+            .context("auth endpoint")
     });
     if login_listen != cfg.auth_listen {
-        let auth_state_b = auth_state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::auth_endpoint::serve(&login_listen, auth_state_b).await {
-                tracing::error!("auth endpoint (login_listen): {e:#}");
-            }
+        workers.spawn(async move {
+            crate::auth_endpoint::serve(&login_listen, auth_state)
+                .await
+                .context("login endpoint")
         });
     }
-
-    // DNS reconciler.
     let reconciler = Arc::new(Reconciler::new(cfg.clone(), registry.clone(), dns));
-    tokio::spawn(async move {
-        if let Err(e) = reconciler.run_forever().await {
-            tracing::error!("dns reconciler: {e:#}");
-        }
-    });
-
-    // SSH bastion side-car. The bastion sshd's `ForceCommand` helper
-    // (`tuntun-server tcp-forward <tenant>`) connects to this unix socket;
-    // the listener routes the connection to the right tenant's tunnel via
-    // the registry and a [`StreamOpenBuiltinFrame`].
+    workers.spawn(async move { reconciler.run_forever().await.context("DNS reconciler") });
     let bastion_socket = cfg.bastion_socket.clone();
     let bastion_registry = registry.clone();
-    tokio::spawn(async move {
-        if let Err(e) = bastion::run_listener(bastion_socket, bastion_registry).await {
-            tracing::error!("ssh bastion: {e:#}");
-        }
+    workers.spawn(async move {
+        bastion::run_listener(bastion_socket, bastion_registry)
+            .await
+            .context("SSH bastion")
     });
-
-    // Tunnel acceptor.
-    let acceptor = Arc::new(Acceptor::new(
-        cfg.clone(),
-        registry.clone(),
-        supervisor,
-        tls_handle,
-    ));
-    acceptor.run().await
+    let caddy = supervisor.clone();
+    workers.spawn(async move { caddy.supervise().await });
+    let acceptor = Arc::new(Acceptor::new(cfg, registry, supervisor, tls_handle));
+    workers.spawn(async move { acceptor.run().await.context("tunnel acceptor") });
+    // A vanished critical worker must not leave an apparently healthy daemon.
+    workers
+        .join_next()
+        .await
+        .context("no server workers")?
+        .context("server worker panicked")??;
+    Err(anyhow::anyhow!("server worker exited unexpectedly"))
 }
 
 async fn load_signing_key(secrets: &CredentialDirSecrets) -> Result<SigningKey> {
@@ -122,7 +113,7 @@ async fn load_signing_key(secrets: &CredentialDirSecrets) -> Result<SigningKey> 
         .load(&key)
         .await
         .context("load server-signing-key from systemd CREDENTIALS_DIRECTORY (configure services.tuntun-server.serverSigningKeyFile)")?;
-    let pem = std::str::from_utf8(value.expose_bytes())
-        .context("server-signing-key is not utf-8 PEM")?;
+    let pem =
+        std::str::from_utf8(value.expose_bytes()).context("server-signing-key is not utf-8 PEM")?;
     SigningKey::from_pkcs8_pem(pem).map_err(|e| anyhow::anyhow!("parse signing key: {e}"))
 }

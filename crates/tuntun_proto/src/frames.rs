@@ -92,6 +92,10 @@ pub enum ControlFrame {
     ListBlessings(ListBlessingsFrame),
     /// Server -> Client. Reply to a [`ListBlessingsFrame`].
     BlessingsList(BlessingsListFrame),
+
+    /// Authenticated management session. Does not publish a tunnel or replace
+    /// the tenant's laptop. The server acknowledges with empty `Registered`.
+    ControlOnly,
 }
 
 // ---------------------------------------------------------------------------

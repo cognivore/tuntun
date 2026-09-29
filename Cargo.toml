@@ -43,7 +43,7 @@ zeroize = { version = "1", features = ["derive"] }
 # --- I/O dependencies (allowed only in tuntun_cli and tuntun_server) ---
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-tokio-util = { version = "0.7", features = ["codec", "io", "compat"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "compat", "rt"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 rcgen = "0.13"

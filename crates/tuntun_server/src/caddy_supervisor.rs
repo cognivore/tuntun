@@ -28,6 +28,7 @@ pub struct CaddySupervisor {
 #[derive(Debug, Default)]
 struct SupervisorState {
     last_rendered: Option<String>,
+    child: Option<tokio::process::Child>,
 }
 
 impl CaddySupervisor {
@@ -59,18 +60,36 @@ impl CaddySupervisor {
             .arg("--adapter")
             .arg("caddyfile")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
 
-        cmd.spawn()
+        let child = cmd
+            .spawn()
             .with_context(|| format!("spawn caddy at {}", self.config.caddy_bin.display()))?;
+        self.state.lock().await.child = Some(child);
         tracing::info!("caddy launched");
         Ok(())
     }
 
+    /// A dead Caddy invalidates the daemon's published web routes. Return the
+    /// failure to systemd, which reconstructs this process and its children.
+    pub async fn supervise(&self) -> Result<()> {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut state = self.state.lock().await;
+            let child = state
+                .child
+                .as_mut()
+                .context("Caddy has no supervised process")?;
+            if let Some(status) = child.try_wait().context("check Caddy process")? {
+                return Err(anyhow!("Caddy exited: {status}"));
+            }
+        }
+    }
+
     /// Render a fresh Caddyfile from `input` and trigger Caddy to reload.
     pub async fn render_and_reload(&self, input: &CaddyInput) -> Result<()> {
-        let rendered = render_caddyfile(input)
-            .map_err(|e| anyhow!("render Caddyfile: {e}"))?;
+        let rendered = render_caddyfile(input).map_err(|e| anyhow!("render Caddyfile: {e}"))?;
 
         let mut state = self.state.lock().await;
         if state.last_rendered.as_deref() == Some(rendered.as_str()) {
@@ -79,22 +98,26 @@ impl CaddySupervisor {
         }
 
         atomic_write(&self.config.caddyfile_path, rendered.as_bytes()).await?;
+        self.reload().await?;
         state.last_rendered = Some(rendered);
-        drop(state);
-
-        self.reload().await
+        Ok(())
     }
 
     async fn reload(&self) -> Result<()> {
-        let output = tokio::process::Command::new(&self.config.caddy_bin)
-            .arg("reload")
-            .arg("--config")
-            .arg(&self.config.caddyfile_path)
-            .arg("--address")
-            .arg(&self.config.caddy_admin)
-            .output()
-            .await
-            .context("spawn caddy reload")?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(&self.config.caddy_bin)
+                .arg("reload")
+                .arg("--config")
+                .arg(&self.config.caddyfile_path)
+                .arg("--address")
+                .arg(&self.config.caddy_admin)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .context("Caddy reload timed out")?
+        .context("spawn caddy reload")?;
 
         if !output.status.success() {
             return Err(anyhow!(

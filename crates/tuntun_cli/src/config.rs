@@ -21,6 +21,9 @@ pub struct DaemonConfig {
     pub server_host: String,
     pub server_pubkey_fingerprint: String,
     pub default_tenant: String,
+    /// Stable device identity. Empty means the primary `laptop-<tenant>`.
+    #[serde(default)]
+    pub client_id: String,
     pub state_dir: PathBuf,
     #[serde(default = "default_private_key_secret_name")]
     pub private_key_secret_name: String,
@@ -70,8 +73,7 @@ impl DaemonConfig {
         // we want to avoid pulling another dep. Use a minimal hand parser
         // sufficient for the small flat schema. For richer needs, switch to
         // the `toml` crate later.
-        parse_minimal_toml(&bytes)
-            .with_context(|| format!("parse config at {}", path.display()))
+        parse_minimal_toml(&bytes).with_context(|| format!("parse config at {}", path.display()))
     }
 }
 
@@ -94,8 +96,29 @@ fn parse_minimal_toml(bytes: &[u8]) -> Result<DaemonConfig> {
         let (k, v) = line
             .split_once('=')
             .ok_or_else(|| anyhow!("line {}: expected `key = \"value\"`", lineno + 1))?;
+        let key = k.trim();
+        anyhow::ensure!(
+            [
+                "server_host",
+                "server_pubkey_fingerprint",
+                "default_tenant",
+                "client_id",
+                "state_dir",
+                "private_key_secret_name",
+                "tuntun_flake_ref",
+                "ssh_local_port",
+                "server_domain",
+            ]
+            .contains(&key),
+            "line {}: unknown configuration field {key}",
+            lineno + 1
+        );
         let v = v.trim().trim_matches('"').to_string();
-        map.insert(k.trim().to_string(), v);
+        anyhow::ensure!(
+            map.insert(key.to_string(), v).is_none(),
+            "line {}: duplicate field {key}",
+            lineno + 1
+        );
     }
 
     let take = |k: &str| -> Result<String> {
@@ -108,6 +131,7 @@ fn parse_minimal_toml(bytes: &[u8]) -> Result<DaemonConfig> {
         server_host: take("server_host")?,
         server_pubkey_fingerprint: take("server_pubkey_fingerprint")?,
         default_tenant: take("default_tenant")?,
+        client_id: map.get("client_id").cloned().unwrap_or_default(),
         state_dir: PathBuf::from(take("state_dir")?),
         private_key_secret_name: map
             .get("private_key_secret_name")

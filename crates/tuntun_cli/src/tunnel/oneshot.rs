@@ -19,11 +19,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use rustls::pki_types::ServerName;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::task::AbortOnDropHandle;
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode};
 
 use tuntun_auth::tunnel_auth::build_challenge_message;
@@ -32,8 +33,7 @@ use tuntun_core::{
     TunnelClientId,
 };
 use tuntun_proto::{
-    encode_frame, AuthResponseFrame, ControlFrame, FrameBuffer, HelloFrame, RegisterFrame,
-    PROTOCOL_VERSION,
+    encode_frame, AuthResponseFrame, ControlFrame, FrameBuffer, HelloFrame, PROTOCOL_VERSION,
 };
 
 use crate::adapters::secret::RageveilSecrets;
@@ -53,7 +53,7 @@ pub struct OneShotSession {
     /// bytes from one frame are available for the next, instead of being
     /// silently dropped — which would manifest as a hang on the next read.
     inbox: FrameBuffer,
-    driver: JoinHandle<()>,
+    driver: AbortOnDropHandle<()>,
 }
 
 impl OneShotSession {
@@ -62,11 +62,7 @@ impl OneShotSession {
     ///
     /// `client_label` is mixed into the [`TunnelClientId`] so server-side
     /// logs can tell `bless`, `unbless`, etc. apart.
-    pub async fn open(
-        cfg: &DaemonConfig,
-        tenant: &TenantId,
-        client_label: &str,
-    ) -> Result<Self> {
+    pub async fn open(cfg: &DaemonConfig, tenant: &TenantId, client_label: &str) -> Result<Self> {
         let signing_key = load_signing_key(cfg).await?;
         let tls = connect_tls(cfg).await?;
         let mut yamux_conn =
@@ -78,15 +74,14 @@ impl OneShotSession {
         let mut control = stream.compat();
         let mut inbox = FrameBuffer::new();
 
-        let driver = tokio::spawn(async move {
+        let driver = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut conn = yamux_conn;
             loop {
-                let res =
-                    poll_fn(|cx| std::pin::Pin::new(&mut conn).poll_next_inbound(cx)).await;
+                let res = poll_fn(|cx| std::pin::Pin::new(&mut conn).poll_next_inbound(cx)).await;
                 let Some(Ok(stream)) = res else { break };
                 drop(stream);
             }
-        });
+        }));
 
         // Hello / Welcome.
         let client_id = TunnelClientId::new(format!("{client_label}-{}", tenant.as_str()))
@@ -129,7 +124,7 @@ impl OneShotSession {
         }
 
         // Empty Register so the server's protocol state machine advances.
-        let register = ControlFrame::Register(RegisterFrame { projects: vec![] });
+        let register = ControlFrame::ControlOnly;
         write_frame(&mut control, &register).await?;
         match read_one_frame(&mut control, &mut inbox).await? {
             ControlFrame::Registered(_) => {}
@@ -174,15 +169,19 @@ async fn connect_tls(cfg: &DaemonConfig) -> Result<TlsStream<tokio::net::TcpStre
     let tls_config = Arc::new(build_pinned_client_config(fingerprint));
     let connector = TlsConnector::from(tls_config);
 
-    let tcp = tokio::net::TcpStream::connect(&cfg.server_host)
-        .await
-        .with_context(|| format!("connect to {}", cfg.server_host))?;
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(&cfg.server_host),
+    )
+    .await
+    .context("TCP connect timed out")?
+    .with_context(|| format!("connect to {}", cfg.server_host))?;
     let server_name =
         ServerName::try_from("tuntun.invalid").map_err(|e| anyhow!("server name: {e}"))?;
-    connector
-        .connect(server_name, tcp)
+    tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
         .await
-        .map_err(|e| anyhow!("tls connect: {e}"))
+        .context("TLS handshake timed out")?
+        .context("TLS connect")
 }
 
 async fn write_frame<S>(s: &mut S, frame: &ControlFrame) -> Result<()>
@@ -190,12 +189,15 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let bytes = encode_frame(frame).map_err(|e| anyhow!("encode frame: {e}"))?;
-    s.write_all(&bytes).await.map_err(|e| anyhow!("write: {e}"))?;
-    s.flush().await.map_err(|e| anyhow!("flush: {e}"))?;
-    Ok(())
+    tokio::time::timeout(Duration::from_secs(5), async {
+        s.write_all(&bytes).await.context("control write")?;
+        s.flush().await.context("control flush")
+    })
+    .await
+    .context("control write timed out")?
 }
 
-async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
+async fn read_one_frame_inner<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -221,4 +223,13 @@ where
             Err(e) => bail!("read: {e}"),
         }
     }
+}
+
+async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(10), read_one_frame_inner(s, inbox))
+        .await
+        .context("control response timed out")?
 }

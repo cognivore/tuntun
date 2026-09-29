@@ -281,7 +281,7 @@ echo "tuntun: blessed for {host_alias}"
     Ok(())
 }
 
-fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
+pub(super) fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     let alg = b"ssh-ed25519";
@@ -300,7 +300,7 @@ fn encode_openssh_ed25519_public(raw: &[u8; 32]) -> String {
 /// We deliberately do not add a `command="..."` restriction here. The
 /// equivalent restriction lives only at the bastion — that's its whole
 /// purpose. The laptop endpoint is a normal interactive sshd login.
-async fn append_local_authorized_key(label: &str, openssh_line: &str) -> Result<()> {
+pub(super) async fn append_local_authorized_key(label: &str, openssh_line: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let home = std::env::var("HOME").map_err(|_| anyhow!("HOME env var not set"))?;
@@ -310,7 +310,9 @@ async fn append_local_authorized_key(label: &str, openssh_line: &str) -> Result<
         .with_context(|| format!("create {}", ssh_dir.display()))?;
     // Tighten ssh dir perms if it was just created world-readable; harmless
     // if already 0700.
-    let _ = tokio::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).await;
+    tokio::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+        .await
+        .context("secure SSH directory permissions")?;
 
     let auth_path = ssh_dir.join("authorized_keys");
     let existing = match tokio::fs::read_to_string(&auth_path).await {
@@ -322,8 +324,16 @@ async fn append_local_authorized_key(label: &str, openssh_line: &str) -> Result<
         }
     };
 
-    if existing.lines().any(|l| l.contains(label)) {
+    if existing.lines().any(|line| line == openssh_line.trim_end()) {
         return Ok(());
+    }
+    if existing
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some(label))
+    {
+        bail!(
+            "SSH label {label} already names another key; revoke it explicitly before replacing it"
+        );
     }
 
     let mut updated = existing;

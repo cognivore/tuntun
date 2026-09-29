@@ -1,30 +1,20 @@
-//! In-memory registry of currently-connected tunnel clients and their
-//! registered services. Backed by `tokio::sync::RwLock`.
-//!
-//! Keys are typed via `tuntun_core` newtypes; the registry never accepts
-//! raw strings.
-
+//! Published tunnels keyed by tenant and device. Cleanup checks session identity.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
-
+use tokio_util::sync::CancellationToken;
 use tuntun_core::{Fqdn, ProjectId, ServiceName, ServicePort, TenantId, TunnelClientId};
-use tuntun_proto::{AuthPolicy, ControlFrame, HealthCheckSpec};
+use tuntun_proto::{AuthPolicy, HealthCheckSpec};
 
 use crate::tunnel::per_service_listener::OpenStreamRequest;
-
-const PORT_FLOOR: u16 = 20_000;
 
 #[derive(Clone)]
 pub struct ClientRecord {
     pub client_id: TunnelClientId,
     pub tenant: TenantId,
-    pub control_tx: mpsc::Sender<ControlFrame>,
-    /// Channel into the session's stream-opener task. External components
-    /// (notably the SSH bastion side-car) clone this to ask the session to
-    /// allocate a yamux stream and pipe bytes from an inbound transport.
     pub stream_tx: mpsc::Sender<OpenStreamRequest>,
+    pub cancelled: CancellationToken,
     pub projects: BTreeMap<ProjectId, ProjectRecord>,
 }
 
@@ -55,98 +45,96 @@ pub struct ServiceRecord {
 
 #[derive(Debug, Default)]
 pub struct Registry {
-    inner: RwLock<RegistryInner>,
-}
-
-#[derive(Debug, Default)]
-struct RegistryInner {
-    clients: BTreeMap<TunnelClientId, ClientRecord>,
-    /// Reverse index: which client owns which fqdn.
-    fqdn_to_client: BTreeMap<Fqdn, TunnelClientId>,
-    next_port: u16,
+    clients: RwLock<BTreeMap<(TenantId, TunnelClientId), ClientRecord>>,
+    /// Serialize Caddy snapshots and reloads to prevent stale publication.
+    pub publication: tokio::sync::Mutex<()>,
 }
 
 impl Registry {
-    pub fn new(port_range_start: u16) -> Self {
-        Self {
-            inner: RwLock::new(RegistryInner {
-                clients: BTreeMap::new(),
-                fqdn_to_client: BTreeMap::new(),
-                next_port: port_range_start,
-            }),
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn upsert_client(&self, record: ClientRecord) {
+        let mut clients = self.clients.write().await;
+        if let Some(previous) =
+            clients.insert((record.tenant.clone(), record.client_id.clone()), record)
+        {
+            previous.cancelled.cancel();
         }
     }
 
-    pub async fn upsert_client(self: &Arc<Self>, record: ClientRecord) {
-        let mut inner = self.inner.write().await;
-        inner.clients.insert(record.client_id.clone(), record);
-    }
-
-    pub async fn drop_client(self: &Arc<Self>, client_id: &TunnelClientId) {
-        let mut inner = self.inner.write().await;
-        if let Some(client) = inner.clients.remove(client_id) {
-            for (_, project) in client.projects {
-                for (_, svc) in project.services {
-                    inner.fqdn_to_client.remove(&svc.fqdn);
-                }
-            }
+    pub async fn drop_client(&self, record: &ClientRecord) {
+        let mut clients = self.clients.write().await;
+        let key = (record.tenant.clone(), record.client_id.clone());
+        if clients
+            .get(&key)
+            .is_some_and(|current| current.stream_tx.same_channel(&record.stream_tx))
+        {
+            clients.remove(&key);
         }
     }
 
-    pub async fn allocate_port(self: &Arc<Self>) -> ServicePort {
-        // Clamp into [PORT_FLOOR, u16::MAX] so ServicePort::new never fails
-        // (its only invariant is `>= 1`). We bias high to stay clear of
-        // user-managed services on the same host.
-        let mut inner = self.inner.write().await;
-        if inner.next_port < PORT_FLOOR {
-            inner.next_port = PORT_FLOOR;
-        }
-        let p = inner.next_port;
-        inner.next_port = inner.next_port.saturating_add(1);
-        ServicePort::new(p).unwrap_or_else(|_| {
-            ServicePort::new(PORT_FLOOR).unwrap_or_else(|_| {
-                // Truly unreachable: PORT_FLOOR is a non-zero const.
-                ServicePort::new(1).unwrap_or_else(|_| unreachable!())
-            })
-        })
-    }
-
-    pub async fn snapshot_services(self: &Arc<Self>) -> Vec<ServiceRecord> {
-        let inner = self.inner.read().await;
-        let mut out = Vec::new();
-        for client in inner.clients.values() {
-            for project in client.projects.values() {
-                for svc in project.services.values() {
-                    out.push(svc.clone());
-                }
-            }
-        }
-        out
-    }
-
-    pub async fn lookup_by_fqdn(self: &Arc<Self>, fqdn: &Fqdn) -> Option<TunnelClientId> {
-        self.inner
+    pub async fn snapshot_services(&self) -> Vec<ServiceRecord> {
+        self.clients
             .read()
             .await
-            .fqdn_to_client
-            .get(fqdn)
-            .cloned()
+            .values()
+            .flat_map(|client| client.projects.values())
+            .flat_map(|project| project.services.values().cloned())
+            .collect()
     }
 
-    /// Find the [`ClientRecord`] currently serving the given tenant, if any.
-    /// Used by the SSH bastion side-car to dispatch incoming bastion
-    /// connections to the right connected laptop.
-    ///
-    /// At most one client is expected per tenant in v1; if multiple clients
-    /// have registered for the same tenant we return the lexicographically
-    /// first one (deterministic, but the multi-client case is not yet a
-    /// supported configuration).
     pub async fn lookup_by_tenant(self: &Arc<Self>, tenant: &TenantId) -> Option<ClientRecord> {
-        let inner = self.inner.read().await;
-        inner
-            .clients
+        // The stable reverse-SSH address always targets the primary laptop.
+        // Other devices use distinct client IDs and may publish web services.
+        let clients = self.clients.read().await;
+        clients
             .values()
-            .find(|c| &c.tenant == tenant)
+            .find(|client| {
+                &client.tenant == tenant && client.client_id.as_str() == format!("laptop-{tenant}")
+            })
             .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(tenant: &str) -> ClientRecord {
+        ClientRecord {
+            client_id: TunnelClientId::new(format!("laptop-{tenant}")).expect("valid client id"),
+            tenant: TenantId::new(tenant).expect("valid tenant"),
+            stream_tx: mpsc::channel(1).0,
+            cancelled: CancellationToken::new(),
+            projects: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_cannot_remove_replacement_or_another_tenant() {
+        let registry = Arc::new(Registry::new());
+        let old = client("alice");
+        let new = client("alice");
+        let other = client("bob");
+        let mut secondary = client("alice");
+        secondary.client_id = TunnelClientId::new("octoprophet").expect("device id");
+        registry.upsert_client(old.clone()).await;
+        registry.upsert_client(other.clone()).await;
+        registry.upsert_client(secondary.clone()).await;
+        registry.upsert_client(new.clone()).await;
+        assert!(old.cancelled.is_cancelled());
+        assert!(!other.cancelled.is_cancelled());
+        assert!(!secondary.cancelled.is_cancelled());
+        registry.drop_client(&old).await;
+        let current = registry
+            .lookup_by_tenant(&new.tenant)
+            .await
+            .expect("replacement survives");
+        assert!(current.stream_tx.same_channel(&new.stream_tx));
+        assert!(registry.lookup_by_tenant(&other.tenant).await.is_some());
+        registry.drop_client(&new).await;
+        assert!(registry.lookup_by_tenant(&new.tenant).await.is_none());
     }
 }

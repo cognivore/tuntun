@@ -159,10 +159,19 @@ macro_rules! define_numeric_id {
             Ord,
             Hash,
             ::serde::Serialize,
-            ::serde::Deserialize,
         )]
         #[serde(transparent)]
         $vis struct $name($repr);
+
+        impl<'de> ::serde::Deserialize<'de> for $name {
+            fn deserialize<D>(d: D) -> ::core::result::Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                let value = <$repr as ::serde::Deserialize>::deserialize(d)?;
+                Self::new(value).map_err(::serde::de::Error::custom)
+            }
+        }
 
         impl $name {
             #[allow(dead_code)]

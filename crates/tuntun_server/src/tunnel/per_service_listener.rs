@@ -13,16 +13,15 @@
 //! local to the session.
 
 use std::io;
-use std::net::SocketAddr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use yamux::Stream as YamuxStream;
 
-use tuntun_core::{ProjectId, ServiceName, ServicePort};
+use tuntun_core::{ProjectId, ServiceName};
 use tuntun_proto::{BuiltinService, ControlFrame, StreamOpenBuiltinFrame, StreamOpenFrame};
 
 /// Trait alias for "a bidirectional byte stream we can pump through a yamux
@@ -57,26 +56,21 @@ pub(crate) struct OpenStreamRequest {
 pub async fn run_listener(
     project: ProjectId,
     service: ServiceName,
-    server_port: ServicePort,
+    listener: TcpListener,
     tx: mpsc::Sender<OpenStreamRequest>,
 ) -> Result<()> {
-    let addr: SocketAddr =
-        format!("127.0.0.1:{}", server_port.value()).parse().map_err(
-            |e| anyhow!("parse listen addr 127.0.0.1:{}: {e}", server_port.value()),
-        )?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind public listener for service {service} on {addr}"))?;
-    tracing::info!(
-        "service {project}/{service} listening on {addr}"
-    );
+    let addr = listener.local_addr().context("service listener address")?;
+    tracing::info!("service {project}/{service} listening on {addr}");
 
     loop {
-        let (sock, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            () = tx.closed() => return Ok(()),
+            result = listener.accept() => result,
+        };
+        let (sock, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("public accept on {addr}: {e}");
-                continue;
+                return Err(anyhow::Error::new(e).context(format!("public accept on {addr}")));
             }
         };
         tracing::debug!("public connection on {addr} from {peer}");
@@ -91,9 +85,7 @@ pub async fn run_listener(
             ack: ack_tx,
         };
         if tx.send(request).await.is_err() {
-            tracing::info!(
-                "service {service} listener exiting: session closed"
-            );
+            tracing::info!("service {service} listener exiting: session closed");
             return Ok(());
         }
 
@@ -138,9 +130,35 @@ pub(crate) fn build_stream_open(
 }
 
 /// Helper: build a [`StreamOpenBuiltinFrame`] for a side-car stream.
-pub(crate) fn build_stream_open_builtin(
-    stream_id: u32,
-    kind: BuiltinService,
-) -> ControlFrame {
+pub(crate) fn build_stream_open_builtin(stream_id: u32, kind: BuiltinService) -> ControlFrame {
     ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame { stream_id, kind })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_close_releases_an_idle_listener_without_another_connection() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(run_listener(
+            ProjectId::new("test").expect("project"),
+            ServiceName::new("test").expect("service"),
+            listener,
+            tx,
+        ));
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("idle listener exits")
+            .expect("listener task")
+            .expect("clean close");
+        TcpListener::bind(addr)
+            .await
+            .expect("listening socket was released");
+    }
 }

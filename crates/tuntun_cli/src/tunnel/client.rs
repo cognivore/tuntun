@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
@@ -14,9 +15,12 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::task::AbortOnDropHandle;
 use tuntun_config::ProjectSpec;
+use tuntun_proto::heartbeat::Heartbeat;
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode};
 
 use tuntun_auth::tunnel_auth::build_challenge_message;
@@ -89,7 +93,7 @@ impl TunnelClient {
         // notify_waiters wakes every current await on .notified(); future
         // calls are not pre-armed (which is fine — we just need to wake the
         // single live session).
-        self.projects_changed.notify_waiters();
+        self.projects_changed.notify_one();
     }
 
     /// Run the long-lived client loop. Returns only on fatal error
@@ -109,7 +113,7 @@ impl TunnelClient {
         let mut backoff = BackoffState::new();
         loop {
             match self
-                .run_session(&signing_key, &connector, &tenant)
+                .run_session(&signing_key, &connector, &tenant, &mut backoff)
                 .await
             {
                 Ok(()) => {
@@ -136,8 +140,7 @@ impl TunnelClient {
             .load(&key_name)
             .await
             .context("load tunnel private key from rageveil")?;
-        let pem = std::str::from_utf8(value.expose_bytes())
-            .context("private key is not utf-8")?;
+        let pem = std::str::from_utf8(value.expose_bytes()).context("private key is not utf-8")?;
         SigningKey::from_pkcs8_pem(pem)
             .map_err(|e| anyhow!("parse PEM (regenerate with scripts/regen-client-keys.rs?): {e}"))
     }
@@ -147,20 +150,26 @@ impl TunnelClient {
         signing_key: &SigningKey,
         connector: &TlsConnector,
         tenant: &TenantId,
+        backoff: &mut BackoffState,
     ) -> Result<()> {
         // 1. TCP connect.
-        let tcp = tokio::net::TcpStream::connect(&self.config.server_host)
-            .await
-            .with_context(|| format!("connect to {}", self.config.server_host))?;
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect(&self.config.server_host),
+        )
+        .await
+        .context("TCP connect timed out")?
+        .with_context(|| format!("connect to {}", self.config.server_host))?;
 
         // 2. TLS handshake. Server name doesn't matter for our pinned
         // verifier; pass a placeholder so rustls is happy.
-        let server_name = ServerName::try_from("tuntun.invalid")
-            .map_err(|e| anyhow!("server name: {e}"))?;
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| anyhow!("tls connect: {e}"))?;
+        let server_name =
+            ServerName::try_from("tuntun.invalid").map_err(|e| anyhow!("server name: {e}"))?;
+        let tls_stream =
+            tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+                .await
+                .context("TLS handshake timed out")?
+                .context("TLS handshake")?;
 
         // 3. Yamux client. We open the single outbound (control) stream
         // *before* moving the Connection into the driver task, so the driver
@@ -190,45 +199,43 @@ impl TunnelClient {
         let ssh_local_port = LocalPort::new(self.config.ssh_local_port)
             .map_err(|e| anyhow!("ssh_local_port {}: {e}", self.config.ssh_local_port))?;
         let routing_for_acceptor = routing.clone();
-        let acceptor = tokio::spawn(async move {
+        let mut acceptor = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut conn = yamux_conn;
+            let mut streams = JoinSet::new();
             loop {
-                let res = poll_fn(|cx| {
-                    std::pin::Pin::new(&mut conn).poll_next_inbound(cx)
-                })
-                .await;
-                match res {
-                    None => break,
-                    Some(Ok(stream)) => {
-                        let id = stream.id().val();
-                        let port = wait_for_routing(&routing_for_acceptor, id).await;
-                        match port {
-                            Some(p) => {
-                                tokio::spawn(async move {
-                                    if let Err(e) = pump_stream_to_local(stream, p).await {
-                                        tracing::debug!("stream {id}: {e}");
-                                    }
-                                });
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "no routing entry for inbound yamux stream id={id}"
-                                );
-                                drop(stream);
-                            }
-                        }
+                tokio::select! {
+                    completed = streams.join_next(), if !streams.is_empty() => {
+                        completed.context("stream task set unexpectedly empty")?
+                            .context("stream task panicked")?;
                     }
-                    Some(Err(e)) => {
-                        tracing::debug!("yamux accept: {e}");
-                        break;
+                    res = poll_fn(|cx| conn.poll_next_inbound(cx)) => match res {
+                        Some(Ok(stream)) => {
+                            anyhow::ensure!(streams.len() < 256, "too many inbound tunnel streams");
+                            let routing = routing_for_acceptor.clone();
+                            streams.spawn(async move {
+                                let id = stream.id().val();
+                                if let Some(port) = wait_for_routing(&routing, id).await {
+                                    if let Err(e) = pump_stream_to_local(stream, port).await {
+                                        tracing::debug!(stream_id = id, error = ?e, "local stream ended");
+                                    }
+                                } else {
+                                    tracing::warn!(stream_id = id, "stream routing timed out");
+                                }
+                            });
+                        }
+                        Some(Err(e)) => return Err(anyhow::Error::new(e).context("yamux driver")),
+                        None => return Err(anyhow!("yamux connection closed")),
                     }
                 }
             }
-        });
+        }));
 
         // 5. Send Hello.
-        let client_id_str =
-            format!("laptop-{}", &self.config.default_tenant);
+        let client_id_str = if self.config.client_id.is_empty() {
+            format!("laptop-{}", self.config.default_tenant)
+        } else {
+            self.config.client_id.clone()
+        };
         let client_id = TunnelClientId::new(client_id_str.clone())
             .map_err(|e| anyhow!("derive client id: {e}"))?;
         let hello = ControlFrame::Hello(HelloFrame {
@@ -286,6 +293,9 @@ impl TunnelClient {
         tracing::info!("tunnel authenticated as {tenant}");
 
         // 10. Build and send Register.
+        // Consume any pending notification BEFORE reading the snapshot. A later
+        // change retains a permit and forces another registration.
+        let _ = tokio::time::timeout(Duration::ZERO, self.projects_changed.notified()).await;
         let snapshot = self.projects.read().await.clone();
         let (register_frame, routing_seed) = build_register_frame(&snapshot)?;
         let register = ControlFrame::Register(register_frame);
@@ -296,6 +306,7 @@ impl TunnelClient {
         let ControlFrame::Registered(registered) = registered else {
             return Err(anyhow!("expected Registered, got {registered:?}"));
         };
+        backoff.reset();
         tracing::info!(
             "registered {} services with server",
             registered.allocations.len()
@@ -318,6 +329,9 @@ impl TunnelClient {
                 ssh_local_port,
                 routing.clone(),
             ) => r,
+            result = &mut acceptor => {
+                result.context("tunnel driver task panicked")?
+            }
             () = projects_changed.notified() => {
                 tracing::info!("projects snapshot changed; tearing down session to re-register");
                 Ok(())
@@ -357,23 +371,21 @@ fn build_register_frame(
                 tuntun_config::AuthPolicy::Tenant => tuntun_proto::AuthPolicy::Tenant,
                 tuntun_config::AuthPolicy::Public => tuntun_proto::AuthPolicy::Public,
             };
-            let health = svc_spec.health_check.as_ref().map(|h| {
-                tuntun_proto::HealthCheckSpec {
+            let health = svc_spec
+                .health_check
+                .as_ref()
+                .map(|h| tuntun_proto::HealthCheckSpec {
                     path: h.path.clone(),
                     expected_status: h.expected_status,
                     timeout_seconds: h.timeout_seconds,
-                }
-            });
+                });
             svcs.push(ServiceRegistration {
                 service: svc_name.clone(),
                 subdomain: svc_spec.subdomain.clone(),
                 auth_policy,
                 health_check: health,
             });
-            local_routing.insert(
-                (project_id.clone(), svc_name.clone()),
-                svc_spec.local_port,
-            );
+            local_routing.insert((project_id.clone(), svc_name.clone()), svc_spec.local_port);
         }
         projects.push(ProjectRegistration {
             project: project_id,
@@ -394,17 +406,33 @@ async fn run_control_loop<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let started = tokio::time::Instant::now();
+    let mut heartbeat = Heartbeat::new(rand::random());
     loop {
-        let frame = match read_one_frame_opt(control, inbox).await? {
+        let received = tokio::select! {
+            () = tokio::time::sleep_until(started + heartbeat.deadline()) => {
+                if let Some(ping) = heartbeat.poll(started.elapsed())? {
+                    write_frame(control, &ControlFrame::Ping(ping)).await?;
+                }
+                continue;
+            }
+            frame = read_one_frame_opt(control, inbox) => frame?,
+        };
+        let frame = match received {
             Some(f) => f,
-            None => return Ok(()),
+            None => return Err(anyhow!("server closed control stream")),
         };
         match frame {
             ControlFrame::StreamOpen(open) => {
                 let key = (open.project.clone(), open.service.clone());
                 if let Some(port) = local_routing.get(&key) {
                     let mut r = routing.lock().await;
-                    r.map.insert(open.stream_id, *port);
+                    anyhow::ensure!(r.map.len() < 256, "too many pending stream routes");
+                    anyhow::ensure!(
+                        r.map.insert(open.stream_id, *port).is_none(),
+                        "duplicate stream route {}",
+                        open.stream_id
+                    );
                     r.notify.notify_waiters();
                 } else {
                     tracing::warn!(
@@ -417,7 +445,12 @@ where
             ControlFrame::StreamOpenBuiltin(open) => match open.kind {
                 BuiltinService::Ssh => {
                     let mut r = routing.lock().await;
-                    r.map.insert(open.stream_id, ssh_local_port);
+                    anyhow::ensure!(r.map.len() < 256, "too many pending stream routes");
+                    anyhow::ensure!(
+                        r.map.insert(open.stream_id, ssh_local_port).is_none(),
+                        "duplicate stream route {}",
+                        open.stream_id
+                    );
                     r.notify.notify_waiters();
                     tracing::debug!(
                         "builtin ssh stream {} -> 127.0.0.1:{}",
@@ -430,7 +463,7 @@ where
                 let pong = ControlFrame::Pong(tuntun_proto::PongFrame { nonce: p.nonce });
                 write_frame(control, &pong).await?;
             }
-            ControlFrame::Pong(_) => { /* swallow */ }
+            ControlFrame::Pong(pong) => heartbeat.on_pong(pong.nonce),
             ControlFrame::StreamData(_) | ControlFrame::StreamClose(_) => {
                 // Stream data is carried in-band on yamux streams; these
                 // out-of-band frames are not expected in the current flow.
@@ -450,35 +483,30 @@ async fn wait_for_routing(
     routing: &Arc<Mutex<StreamRouting>>,
     stream_id: u32,
 ) -> Option<LocalPort> {
-    // The StreamOpen control frame and the inbound yamux stream race; the
-    // control frame is small and is usually processed first, but the
-    // control loop serializes (and may be busy writing a Pong reply, etc.).
-    // Wait for at most 10s, woken every time the control loop inserts a
-    // new route via `notify.notify_waiters`. Two seconds — the previous
-    // value — was inadequate when the control loop was momentarily blocked
-    // on a slow write.
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let notify = routing.lock().await.notify.clone();
     loop {
-        let notify = {
-            let r = routing.lock().await;
-            if let Some(port) = r.map.get(&stream_id).copied() {
-                return Some(port);
-            }
-            r.notify.clone()
-        };
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        if tokio::time::timeout(remaining, notify.notified()).await.is_err() {
-            return None;
+        // Register before checking the map, so an insertion cannot be lost
+        // between the check and awaiting notification.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(port) = routing.lock().await.map.remove(&stream_id) {
+            return Some(port);
         }
+        tokio::time::timeout_at(deadline, notified).await.ok()?;
     }
 }
 
 async fn pump_stream_to_local(yamux_stream: yamux::Stream, port: LocalPort) -> Result<()> {
     let addr = format!("127.0.0.1:{}", port.value());
-    let tcp = tokio::net::TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("connect local {addr}"))?;
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .context("local connection timed out")?
+    .with_context(|| format!("connect local {addr}"))?;
     let mut yamux = yamux_stream.compat();
     let mut tcp = tcp;
     let _ = tokio::io::copy_bidirectional(&mut yamux, &mut tcp)
@@ -491,7 +519,10 @@ async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<Control
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    match read_one_frame_opt(s, inbox).await? {
+    match tokio::time::timeout(Duration::from_secs(10), read_one_frame_opt(s, inbox))
+        .await
+        .context("control handshake timed out")??
+    {
         Some(f) => Ok(f),
         None => Err(anyhow!("unexpected EOF on control stream")),
     }
@@ -502,17 +533,14 @@ where
 /// writes (Welcome + AuthChallenge are sent back-to-back, for instance), so
 /// the inbox preserves leftover bytes after a frame is popped — otherwise
 /// the next read silently waits forever for bytes that already arrived.
-async fn read_one_frame_opt<S>(
-    s: &mut S,
-    inbox: &mut FrameBuffer,
-) -> Result<Option<ControlFrame>>
+async fn read_one_frame_opt<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<Option<ControlFrame>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     match inbox.try_pop_frame() {
         Ok(Some(frame)) => return Ok(Some(frame)),
         Ok(None) => {}
-        Err(e) => return Err(anyhow!("frame decode: {e}")),
+        Err(e) => return Err(anyhow::Error::new(e).context("frame decode")),
     }
     let mut chunk = [0u8; 4096];
     loop {
@@ -528,10 +556,10 @@ where
                 match inbox.try_pop_frame() {
                     Ok(Some(frame)) => return Ok(Some(frame)),
                     Ok(None) => continue,
-                    Err(e) => return Err(anyhow!("frame decode: {e}")),
+                    Err(e) => return Err(anyhow::Error::new(e).context("frame decode")),
                 }
             }
-            Err(e) => return Err(anyhow!("read: {e}")),
+            Err(e) => return Err(anyhow::Error::new(e).context("control read")),
         }
     }
 }
@@ -540,9 +568,63 @@ async fn write_frame<S>(s: &mut S, frame: &ControlFrame) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let bytes = encode_frame(frame).map_err(|e| anyhow!("encode frame: {e}"))?;
-    s.write_all(&bytes).await.map_err(|e| anyhow!("write: {e}"))?;
-    s.flush().await.map_err(|e| anyhow!("flush: {e}"))?;
-    Ok(())
+    let bytes = encode_frame(frame).context("encode frame")?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        s.write_all(&bytes).await.context("control write")?;
+        s.flush().await.context("control flush")
+    })
+    .await
+    .context("control write timed out")?
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_is_abandoned_with_heartbeat_evidence() {
+        let (mut control, _silent_peer) = tokio::io::duplex(4096);
+        let result = tokio::time::timeout(
+            Duration::from_secs(51),
+            run_control_loop(
+                &mut control,
+                &mut FrameBuffer::new(),
+                BTreeMap::new(),
+                LocalPort::new(22).expect("SSH port"),
+                Arc::new(Mutex::new(StreamRouting::default())),
+            ),
+        )
+        .await
+        .expect("client detects loss within 50 seconds")
+        .expect_err("silent peer is dead");
+        assert_eq!(
+            result
+                .downcast_ref::<tuntun_proto::heartbeat::HeartbeatTimeout>()
+                .expect("original heartbeat evidence retained")
+                .missed,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_is_consumed_once_even_when_it_arrives_after_the_stream() {
+        let routing = Arc::new(Mutex::new(StreamRouting::default()));
+        let waiter_routing = routing.clone();
+        let waiter = tokio::spawn(async move { wait_for_routing(&waiter_routing, 2).await });
+        tokio::task::yield_now().await;
+        let port = LocalPort::new(22).expect("SSH port");
+        {
+            let mut state = routing.lock().await;
+            state.map.insert(2, port);
+            state.notify.notify_waiters();
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("no missed wakeup")
+                .expect("waiter"),
+            Some(port)
+        );
+        assert!(routing.lock().await.map.is_empty());
+    }
+}

@@ -32,6 +32,7 @@ let
     server_host = "${cfg.serverHost}"
     server_pubkey_fingerprint = "${cfg.serverPubkeyFingerprint}"
     default_tenant = "${cfg.defaultTenant}"
+    client_id = "${cfg.clientId}"
     state_dir = "${cfg.stateDir}"
     private_key_secret_name = "${cfg.privateKeySecretName}"
     ssh_local_port = "${toString cfg.bastion.sshLocalPort}"
@@ -102,6 +103,16 @@ in
       type = lib.types.str;
       example = "jm";
       description = "Tenant id used for `tuntun .` when not overridden by tuntun.nix.";
+    };
+
+    clientId = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Stable device ID. Empty selects laptop-<tenant>, the primary laptop
+        reached through ssh.<tenant>.<domain>. Additional devices MUST use a
+        different ID so reconnecting cannot replace the primary laptop.
+      '';
     };
 
     privateKeySecretName = lib.mkOption {

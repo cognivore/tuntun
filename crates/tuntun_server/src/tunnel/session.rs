@@ -23,6 +23,11 @@ use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
+use tuntun_proto::heartbeat::Heartbeat;
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::VerifyingKey;
@@ -38,9 +43,7 @@ use tuntun_caddy::{
     AuthEndpointConfig, AuthPolicy as CaddyAuthPolicy, CaddyInput, GlobalConfig, LoginSiteConfig,
     ServiceSite,
 };
-use tuntun_core::{
-    Ed25519PublicKey, Fqdn, Nonce, ProjectId, ServiceName, ServicePort, TenantId,
-};
+use tuntun_core::{Ed25519PublicKey, Fqdn, Nonce, ProjectId, ServiceName, ServicePort, TenantId};
 use tuntun_proto::{
     encode_frame, AuthChallengeFrame, AuthPolicy as ProtoAuthPolicy, AuthResultFrame,
     BlessKeyAckFrame, BlessingEntry, BlessingsListFrame, ControlFrame, FrameBuffer, PongFrame,
@@ -67,10 +70,9 @@ pub async fn handle_connection(
     tls: Arc<TlsAcceptorHandle>,
 ) -> Result<()> {
     // 1. TLS accept.
-    let tls_stream = tls
-        .acceptor
-        .accept(sock)
+    let tls_stream = tokio::time::timeout(Duration::from_secs(10), tls.acceptor.accept(sock))
         .await
+        .context("TLS accept timed out")?
         .with_context(|| format!("tls accept from {peer}"))?;
 
     // 2. Yamux server connection. We give exclusive ownership to a single
@@ -89,18 +91,22 @@ pub async fn handle_connection(
     // 3. The first inbound stream is the control stream. We poll it once
     // here so the rest of the session can read/write on it — and *then*
     // move the Connection into the driver task.
-    let control_stream =
-        poll_fn(|cx| std::pin::Pin::new(&mut yamux_conn).poll_next_inbound(cx))
-            .await
-            .ok_or_else(|| anyhow!("client closed before opening control stream"))?
-            .map_err(|e| anyhow!("yamux control stream accept: {e}"))?;
+    let control_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        poll_fn(|cx| yamux_conn.poll_next_inbound(cx)),
+    )
+    .await
+    .context("control stream open timed out")?
+    .ok_or_else(|| anyhow!("client closed before opening control stream"))?
+    .map_err(|e| anyhow!("yamux control stream accept: {e}"))?;
     let mut control = control_stream.compat();
 
     // Channel into the driver: stream_opener tasks send `OpenOutboundCmd`
     // and receive a freshly-allocated yamux Stream back via a oneshot.
     let (open_tx, mut open_rx) = mpsc::channel::<OpenOutboundCmd>(64);
 
-    let driver = tokio::spawn(async move {
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move {
         let mut conn = yamux_conn;
         // Yamux 0.13 only flushes queued outbound writes when the Connection
         // is polled. With nothing else poking it, control-stream frames
@@ -131,15 +137,19 @@ pub async fn handle_connection(
                 // Both `OpenCmd(None)` (the channel closed because the
                 // session is tearing down) and `Inbound(None)` (yamux saw
                 // EOF) mean the same thing: stop driving.
-                DriverEvent::OpenCmd(None) | DriverEvent::Inbound(None) => break,
+                DriverEvent::OpenCmd(None) | DriverEvent::Inbound(None) => {
+                    return Err(anyhow!("yamux driver closed"))
+                }
                 DriverEvent::OpenCmd(Some(cmd)) => {
-                    let res = poll_fn(|cx| {
-                        std::pin::Pin::new(&mut conn).poll_new_outbound(cx)
-                    })
-                    .await;
-                    let _ = cmd.reply.send(
-                        res.map_err(|e| anyhow!("yamux open_outbound: {e}")),
-                    );
+                    let res = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        poll_fn(|cx| conn.poll_new_outbound(cx)),
+                    )
+                    .await
+                    .context("yamux outbound open timed out")?;
+                    let _ = cmd
+                        .reply
+                        .send(res.map_err(|e| anyhow!("yamux open_outbound: {e}")));
                 }
                 DriverEvent::Tick => {
                     // Loop body exists purely so the next iteration's
@@ -147,15 +157,11 @@ pub async fn handle_connection(
                     // I/O state machine and flushes any queued writes.
                 }
                 DriverEvent::Inbound(Some(Ok(stream))) => {
-                    tracing::debug!(
-                        "ignoring extra inbound yamux stream id={}",
-                        stream.id()
-                    );
+                    tracing::debug!("ignoring extra inbound yamux stream id={}", stream.id());
                     drop(stream);
                 }
                 DriverEvent::Inbound(Some(Err(e))) => {
-                    tracing::debug!("yamux driver: inbound error: {e}");
-                    break;
+                    return Err(anyhow::Error::new(e).context("yamux driver"));
                 }
             }
         }
@@ -219,12 +225,29 @@ pub async fn handle_connection(
             "tunnel auth failed for tenant {tenant} from {peer}"
         ));
     }
-    tracing::info!(
-        "tunnel client {client_id} authenticated for tenant {tenant} from {peer}"
-    );
+    tracing::info!("tunnel client {client_id} authenticated for tenant {tenant} from {peer}");
 
     // 6. Register frame.
     let register_frame = read_one_frame(&mut control, &mut control_inbox).await?;
+    if register_frame == ControlFrame::ControlOnly {
+        write_frame(
+            &mut control,
+            &ControlFrame::Registered(RegisteredFrame::default()),
+        )
+        .await?;
+        let (tx, rx) = mpsc::channel(1);
+        // The management session owns no public routes and cannot displace
+        // a laptop. Keeping tx alive lets the shared control loop receive.
+        return control_loop(
+            &mut control,
+            &mut control_inbox,
+            rx,
+            tx,
+            tenant,
+            config.state_dir.clone(),
+        )
+        .await;
+    }
     let ControlFrame::Register(register) = register_frame else {
         return Err(anyhow!("expected Register, got {register_frame:?}"));
     };
@@ -232,10 +255,34 @@ pub async fn handle_connection(
     // Allocate ports and build records.
     let mut allocations: Vec<ServiceAllocation> = Vec::new();
     let mut projects: BTreeMap<ProjectId, ProjectRecord> = BTreeMap::new();
+    let mut listeners = Vec::new();
+    let mut hostnames = std::collections::BTreeSet::new();
+    anyhow::ensure!(register.projects.len() <= 64, "too many projects");
     for proj in &register.projects {
+        anyhow::ensure!(
+            !projects.contains_key(&proj.project),
+            "duplicate project {}",
+            proj.project
+        );
         let mut svc_records: BTreeMap<ServiceName, ServiceRecord> = BTreeMap::new();
         for svc in &proj.services {
-            let port: ServicePort = registry.allocate_port().await;
+            anyhow::ensure!(listeners.len() < 256, "too many services");
+            anyhow::ensure!(
+                !svc_records.contains_key(&svc.service),
+                "duplicate service {}",
+                svc.service
+            );
+            anyhow::ensure!(
+                svc.subdomain.as_str() != "auth" && svc.subdomain.as_str() != "ssh",
+                "reserved service subdomain {}",
+                svc.subdomain
+            );
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .context("reserve service listener")?;
+            let port = ServicePort::new(listener.local_addr()?.port())
+                .context("allocated service port")?;
+            listeners.push((proj.project.clone(), svc.service.clone(), listener));
             // Schema: <subdomain>.<tenant>.<domain> — the tenant is part of
             // the public hostname, so two tenants on the same server can each
             // declare a service called "blog" without conflict.
@@ -245,9 +292,13 @@ pub async fn handle_connection(
                 tenant.as_str(),
                 config.domain
             );
-            let fqdn = Fqdn::new(fqdn_str.clone())
-                .map_err(|e| anyhow!("derive fqdn {fqdn_str}: {e}"))?;
+            let fqdn =
+                Fqdn::new(fqdn_str.clone()).map_err(|e| anyhow!("derive fqdn {fqdn_str}: {e}"))?;
 
+            anyhow::ensure!(
+                hostnames.insert(fqdn.clone()),
+                "duplicate public hostname {fqdn}"
+            );
             allocations.push(ServiceAllocation {
                 project: proj.project.clone(),
                 service: svc.service.clone(),
@@ -287,77 +338,54 @@ pub async fn handle_connection(
     let client_record = ClientRecord {
         client_id: client_id.clone(),
         tenant: tenant.clone(),
-        control_tx: control_tx.clone(),
+        cancelled: CancellationToken::new(),
         stream_tx: stream_tx.clone(),
         projects: projects.clone(),
     };
-    registry.upsert_client(client_record).await;
-
-    // Reply Registered.
-    let registered = ControlFrame::Registered(RegisteredFrame {
-        allocations: allocations.clone(),
-    });
-    write_frame(&mut control, &registered).await?;
-
-    // 7. Trigger Caddyfile re-render with the union of all currently
-    // registered services across all clients.
-    if let Err(e) = render_and_reload_caddy(&supervisor, &config, &registry).await {
-        tracing::warn!("caddy reload failed: {e:#}");
-    }
-
-    // 8. Spin up one public listener per service.
-    for proj in projects.values() {
-        for svc in proj.services.values() {
-            let pid = proj.project.clone();
-            let sname = svc.service.clone();
-            let sport = svc.server_port;
-            let tx = stream_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_listener(pid.clone(), sname.clone(), sport, tx).await {
-                    tracing::warn!("public listener {pid}/{sname}: {e:#}");
-                }
-            });
+    // All listeners are bound before publication. Every later exit runs
+    // cleanup; dropping the task set cancels the driver, listeners and pumps.
+    registry.upsert_client(client_record.clone()).await;
+    let result = async {
+        write_frame(
+            &mut control,
+            &ControlFrame::Registered(RegisteredFrame { allocations }),
+        )
+        .await?;
+        for (project, service, listener) in listeners {
+            tasks.spawn(run_listener(project, service, listener, stream_tx.clone()));
+        }
+        drop(stream_tx);
+        tasks.spawn(stream_opener(open_tx, stream_rx, control_tx.clone()));
+        // Caddy is independent of the SSH control channel; a slow reload
+        // must not stop heartbeats or accepting reverse SSH streams.
+        let supervisor_reload = supervisor.clone();
+        let config_reload = config.clone();
+        let registry_reload = registry.clone();
+        let _reload = AbortOnDropHandle::new(tokio::spawn(async move {
+            if let Err(error) =
+                render_and_reload_caddy(&supervisor_reload, &config_reload, &registry_reload).await
+            {
+                tracing::error!(error = ?error, "Caddy publication failed");
+            }
+        }));
+        tokio::select! {
+            result = control_loop(&mut control, &mut control_inbox, control_rx,
+                control_tx, tenant, config.state_dir.clone()) => result,
+            () = client_record.cancelled.cancelled() => Ok(()),
+            result = tasks.join_next() => {
+                result.context("session task set unexpectedly empty")?
+                    .context("session worker panicked")??;
+                Err(anyhow!("session worker exited unexpectedly"))
+            }
         }
     }
-    // The session keeps a clone of `stream_tx` alive (via the registry) so the
-    // SSH bastion can dispatch builtin requests after the per-service
-    // listeners have exited. Drop the local handle so the channel closes when
-    // both the listeners *and* the registry entry are gone.
-    drop(stream_tx);
-
-    // 10. Stream-opener loop: for each public connection, ask the driver
-    // (via the open_tx channel) to allocate an outbound yamux stream, send
-    // a StreamOpen control frame, and pump bytes.
-    let opener = tokio::spawn(stream_opener(
-        open_tx.clone(),
-        stream_rx,
-        control_tx.clone(),
-    ));
-
-    // 11. Control IO: writer drains control_rx → control stream; reader
-    // handles inbound Ping / Deregister / BlessKey frames.
-    let writer_result = control_loop(
-        &mut control,
-        &mut control_inbox,
-        control_rx,
-        control_tx,
-        tenant.clone(),
-        config.state_dir.clone(),
-    )
     .await;
-    if let Err(e) = writer_result {
-        tracing::info!("control loop ended for {client_id}: {e:#}");
+    tasks.shutdown().await;
+    registry.drop_client(&client_record).await;
+    if let Err(error) = render_and_reload_caddy(&supervisor, &config, &registry).await {
+        tracing::error!(error = ?error, client_id = %client_id, "Caddy cleanup failed");
     }
-
-    // 12. Tear down.
-    registry.drop_client(&client_id).await;
-    if let Err(e) = render_and_reload_caddy(&supervisor, &config, &registry).await {
-        tracing::warn!("caddy reload after disconnect: {e:#}");
-    }
-
-    opener.abort();
-    driver.abort();
-    Ok(())
+    result
 }
 
 /// Driver event surfaced by the single `poll_fn` inside the driver task.
@@ -382,8 +410,25 @@ async fn stream_opener(
     open_tx: mpsc::Sender<OpenOutboundCmd>,
     mut stream_rx: mpsc::Receiver<OpenStreamRequest>,
     control_tx: mpsc::Sender<ControlFrame>,
-) {
-    while let Some(req) = stream_rx.recv().await {
+) -> Result<()> {
+    let mut pumps = JoinSet::new();
+    loop {
+        let req = tokio::select! {
+            result = pumps.join_next(), if !pumps.is_empty() => {
+                result.context("pump task set unexpectedly empty")?.context("stream pump panicked")?;
+                continue;
+            }
+            req = stream_rx.recv() => match req {
+                Some(req) => req,
+                None => return Ok(()),
+            }
+        };
+        if pumps.len() >= 256 {
+            let _ = req
+                .ack
+                .send(Err(anyhow!("session stream capacity reached")));
+            continue;
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if open_tx
             .send(OpenOutboundCmd { reply: reply_tx })
@@ -393,7 +438,10 @@ async fn stream_opener(
             let _ = req.ack.send(Err(anyhow!("yamux driver gone")));
             continue;
         }
-        let outbound = match reply_rx.await {
+        let outbound = match tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .context("stream open reply timed out")?
+        {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 let _ = req.ack.send(Err(e));
@@ -423,12 +471,10 @@ async fn stream_opener(
 
         let ack = req.ack;
         let inbound = req.inbound;
-        tokio::spawn(async move {
+        pumps.spawn(async move {
             match pump_stream(outbound, inbound).await {
                 Ok((up, down)) => {
-                    tracing::debug!(
-                        "stream {log_label} closed; up={up} down={down}"
-                    );
+                    tracing::debug!("stream {log_label} closed; up={up} down={down}");
                     let _ = ack.send(Ok(()));
                 }
                 Err(e) => {
@@ -438,7 +484,6 @@ async fn stream_opener(
             }
         });
     }
-    tracing::debug!("stream opener exiting (no more public connections)");
 }
 
 async fn control_loop<S>(
@@ -452,10 +497,16 @@ async fn control_loop<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    drop(control_tx); // we keep the writer side via control_rx; tx is unused here
+    let _control_tx = control_tx;
+    let started = tokio::time::Instant::now();
+    let mut heartbeat = Heartbeat::new(rand::random());
     loop {
         tokio::select! {
-            biased;
+            () = tokio::time::sleep_until(started + heartbeat.deadline()) => {
+                if let Some(ping) = heartbeat.poll(started.elapsed())? {
+                    write_frame(control, &ControlFrame::Ping(ping)).await?;
+                }
+            }
             outbound = control_rx.recv() => {
                 match outbound {
                     Some(frame) => write_frame(control, &frame).await?,
@@ -468,6 +519,7 @@ where
                         let pong = ControlFrame::Pong(PongFrame { nonce: p.nonce });
                         write_frame(control, &pong).await?;
                     }
+                    Some(ControlFrame::Pong(pong)) => heartbeat.on_pong(pong.nonce),
                     Some(ControlFrame::Deregister(_)) => {
                         tracing::info!("client deregister received");
                         return Ok(());
@@ -751,7 +803,10 @@ async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<Control
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    match read_one_frame_opt(s, inbox).await? {
+    match tokio::time::timeout(Duration::from_secs(10), read_one_frame_opt(s, inbox))
+        .await
+        .context("control handshake timed out")??
+    {
         Some(f) => Ok(f),
         None => Err(anyhow!("unexpected EOF on control stream")),
     }
@@ -763,17 +818,14 @@ where
 /// read (when one TLS read carried more than one frame) are preserved.
 /// Without that, frames coalesced on the wire would silently disappear
 /// after the first one is popped.
-async fn read_one_frame_opt<S>(
-    s: &mut S,
-    inbox: &mut FrameBuffer,
-) -> Result<Option<ControlFrame>>
+async fn read_one_frame_opt<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<Option<ControlFrame>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     match inbox.try_pop_frame() {
         Ok(Some(frame)) => return Ok(Some(frame)),
         Ok(None) => {}
-        Err(e) => return Err(anyhow!("frame decode: {e}")),
+        Err(e) => return Err(anyhow::Error::new(e).context("frame decode")),
     }
     let mut chunk = [0u8; 4096];
     loop {
@@ -789,10 +841,10 @@ where
                 match inbox.try_pop_frame() {
                     Ok(Some(frame)) => return Ok(Some(frame)),
                     Ok(None) => continue,
-                    Err(e) => return Err(anyhow!("frame decode: {e}")),
+                    Err(e) => return Err(anyhow::Error::new(e).context("frame decode")),
                 }
             }
-            Err(e) => return Err(anyhow!("read: {e}")),
+            Err(e) => return Err(anyhow::Error::new(e).context("control read")),
         }
     }
 }
@@ -801,10 +853,13 @@ async fn write_frame<S>(s: &mut S, frame: &ControlFrame) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let bytes = encode_frame(frame).map_err(|e| anyhow!("encode frame: {e}"))?;
-    s.write_all(&bytes).await.map_err(|e| anyhow!("write: {e}"))?;
-    s.flush().await.map_err(|e| anyhow!("flush: {e}"))?;
-    Ok(())
+    let bytes = encode_frame(frame).context("encode frame")?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        s.write_all(&bytes).await.context("control write")?;
+        s.flush().await.context("control flush")
+    })
+    .await
+    .context("control write timed out")?
 }
 
 async fn load_tenant_authorized_keys(
@@ -836,6 +891,7 @@ async fn render_and_reload_caddy(
     cfg: &ServerConfig,
     registry: &Arc<Registry>,
 ) -> Result<()> {
+    let _publication = registry.publication.lock().await;
     let services = registry.snapshot_services().await;
     let mut sites: Vec<ServiceSite> = Vec::with_capacity(services.len());
     for svc in services {

@@ -48,3 +48,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

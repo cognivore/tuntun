@@ -1,5 +1,63 @@
 # tuntun
 
+From an enrolled laptop, reach the primary Mac with:
+
+```console
+ssh ssh.sweater.fere.me
+```
+
+Its SSH URL is **`ssh://sweater@ssh.sweater.fere.me`**. The SSH configuration
+installed during enrollment connects through the public bastion on port 2222,
+then authenticates end to end to the Mac. A bare connection to that hostname's
+port 22 reaches the server's administration endpoint.
+
+The Mac only makes an outbound connection. It can use home Wi-Fi, a phone's
+hotspot, or another network without inbound port forwarding. Both tunnel ends
+send heartbeats every 15 seconds, allow 5 seconds for a reply, and abandon a
+session after three consecutive misses. Reconnection uses jitter with a
+30-second cap and bounded connection/handshake attempts. An interrupted SSH
+session must be opened again; use `tmux` for work that should survive a
+disconnected terminal. The Mac must be awake and online, and its network must
+allow the outbound tunnel port (currently 7000). **tuntun does not change power
+settings.**
+
+On the trusted Mac, enroll the other laptop using its existing key:
+
+```console
+rust-script -f ~/Github/octoprophet/installer/enroll-tuntun.rs --host 192.168.0.103
+```
+
+The script authorizes the laptop's existing Ed25519 public key on both SSH
+hops, installs pinned host keys and SSH configuration, and verifies the
+returned hostname through the public route. For full Octoprophet enrollment,
+use `rust-script -f ~/Github/octoprophet/installer/enroll.rs enroll --host HOST`
+and supply the public enrollment request as before. Always use `-f` after editing
+a rust-script file so the compiled cache cannot hide your changes.
+
+For manual enrollment, `tuntun authorize-key other-laptop.pub --label NAME`
+authorizes an existing public key; `tuntun unbless NAME` revokes that label.
+Never transfer the tunnel private key just to grant SSH access. Verify access
+with `ssh ssh.sweater.fere.me hostname`; `tuntun status` reports configuration,
+not proof that an end-to-end connection currently works.
+
+The primary tunnel uses client ID `laptop-<tenant>`. Every additional device
+publishing services for that tenant needs its own `services.tuntun-cli.clientId`
+(for example `"octoprophet"`), or `client_id` in its daemon config. Additional
+devices do not replace the primary reverse-SSH target. Upgrade the server before
+the clients: management sessions now use the append-only `ControlOnly` frame
+and no longer register a competing tunnel.
+
+To repeat the live failure test from the Mac after enrollment:
+
+```console
+rust-script -f scripts/check-roaming.rs sweater@192.168.0.103
+```
+
+This briefly pauses the tunnel daemon to exercise heartbeat expiry, checks
+recovery, and reconnects three times while checking for leaked listeners.
+It interrupts existing tunneled connections, but never changes networking or
+power settings.
+
 > **VPN for poor**: declarative reverse-tunneling with a cryptographically
 > rigorous authentication layer in front of every exposed service.
 

@@ -59,20 +59,24 @@ pub async fn run_listener(path: PathBuf, registry: Arc<Registry>) -> Result<()> 
         .with_context(|| format!("bind bastion socket {}", path.display()))?;
     set_socket_perms(&path).await?;
     tracing::info!("ssh bastion listener on {}", path.display());
+    let slots = Arc::new(tokio::sync::Semaphore::new(128));
 
     loop {
         match listener.accept().await {
             Ok((sock, _addr)) => {
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let registry = registry.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(e) = handle_connection(sock, registry).await {
                         tracing::info!("bastion connection ended: {e:#}");
                     }
                 });
             }
             Err(e) => {
-                tracing::warn!("bastion accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return Err(e).context("bastion accept failed");
             }
         }
     }
@@ -94,7 +98,13 @@ async fn handle_connection(mut sock: UnixStream, registry: Arc<Registry>) -> Res
     // 1. Read the header line one byte at a time so the underlying socket has
     // no buffered prefix once the header is consumed — the next reader (the
     // session's `pump_stream`) sees only payload bytes.
-    let header = read_header_line(&mut sock).await.context("read header")?;
+    let header = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_header_line(&mut sock),
+    )
+    .await
+    .context("bastion header timed out")?
+    .context("read header")?;
     let tenant_str = header
         .strip_prefix("tenant=")
         .ok_or_else(|| anyhow!("bastion header missing tenant= prefix: {header:?}"))?;
@@ -119,7 +129,7 @@ async fn handle_connection(mut sock: UnixStream, registry: Arc<Registry>) -> Res
         inbound: Box::new(sock),
         ack: ack_tx,
     };
-    if client.stream_tx.send(request).await.is_err() {
+    if client.stream_tx.try_send(request).is_err() {
         return Err(anyhow!(
             "tenant {tenant} session closed while dispatching bastion stream"
         ));
@@ -137,9 +147,7 @@ async fn read_header_line(sock: &mut UnixStream) -> Result<String> {
     let mut byte = [0u8; 1];
     loop {
         if buf.len() >= HEADER_MAX_BYTES {
-            return Err(anyhow!(
-                "bastion header exceeds {HEADER_MAX_BYTES} bytes"
-            ));
+            return Err(anyhow!("bastion header exceeds {HEADER_MAX_BYTES} bytes"));
         }
         let n = sock.read(&mut byte).await?;
         if n == 0 {
@@ -150,7 +158,6 @@ async fn read_header_line(sock: &mut UnixStream) -> Result<String> {
         }
         buf.push(byte[0]);
     }
-    let s = String::from_utf8(buf)
-        .map_err(|e| anyhow!("bastion header is not utf-8: {e}"))?;
+    let s = String::from_utf8(buf).map_err(|e| anyhow!("bastion header is not utf-8: {e}"))?;
     Ok(s.trim_end_matches('\r').to_string())
 }

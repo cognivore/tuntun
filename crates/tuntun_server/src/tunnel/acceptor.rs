@@ -46,16 +46,22 @@ impl Acceptor {
             .with_context(|| format!("parse tunnel_listen {}", self.config.tunnel_listen))?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("tunnel acceptor listening on {addr}");
+        let slots = Arc::new(tokio::sync::Semaphore::new(128));
 
         loop {
             match listener.accept().await {
                 Ok((sock, peer)) => {
+                    let Ok(slot) = slots.clone().try_acquire_owned() else {
+                        tracing::warn!(%peer, "tunnel session capacity reached");
+                        continue;
+                    };
                     tracing::info!("tunnel client connected from {peer}");
                     let registry = self.registry.clone();
                     let config = self.config.clone();
                     let supervisor = self.supervisor.clone();
                     let tls = self.tls.clone();
                     tokio::spawn(async move {
+                        let _slot = slot;
                         if let Err(e) = super::session::handle_connection(
                             sock, peer, registry, config, supervisor, tls,
                         )
@@ -66,8 +72,7 @@ impl Acceptor {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    return Err(e).context("tunnel accept failed");
                 }
             }
         }

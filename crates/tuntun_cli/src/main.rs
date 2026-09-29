@@ -130,6 +130,13 @@ enum Command {
 
     /// List the bastion keys currently authorized for this tenant.
     Blessings,
+
+    /// Authorize an existing Ed25519 public key on the laptop and its bastion.
+    AuthorizeKey {
+        public_key: PathBuf,
+        #[arg(long)]
+        label: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -171,13 +178,14 @@ fn main() -> ExitCode {
             }
             Command::Whoami => commands::whoami::run(cli.config.as_deref()).await,
             Command::Inspect { path } => commands::inspect::run(&path).await,
-            Command::Bless { target } => {
-                commands::bless::run(&target, cli.config.as_deref()).await
-            }
+            Command::Bless { target } => commands::bless::run(&target, cli.config.as_deref()).await,
             Command::Unbless { target } => {
                 commands::unbless::run(&target, cli.config.as_deref()).await
             }
             Command::Blessings => commands::blessings::run(cli.config.as_deref()).await,
+            Command::AuthorizeKey { public_key, label } => {
+                commands::authorize_key::run(&public_key, &label, cli.config.as_deref()).await
+            }
         }
     });
 
@@ -200,8 +208,8 @@ fn init_tracing(verbosity: u8) -> Result<()> {
         _ => "trace",
     };
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
     tracing_subscriber::registry()
         .with(filter)

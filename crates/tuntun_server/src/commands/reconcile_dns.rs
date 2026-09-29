@@ -24,7 +24,7 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
         .await?;
     let dns = Arc::new(PorkbunDns::new(http, PorkbunCreds::new(api, sec)));
 
-    let registry = Arc::new(Registry::new(20_000));
+    let registry = Arc::new(Registry::new());
     let reconciler = Reconciler::new(cfg, registry, dns);
     reconciler.reconcile_once().await
 }

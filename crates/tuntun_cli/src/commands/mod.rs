@@ -1,3 +1,4 @@
+pub mod authorize_key;
 pub mod bless;
 pub mod blessings;
 pub mod daemon;
