@@ -84,9 +84,11 @@ fn render_login_site(out: &mut String, login: &crate::model::LoginSiteConfig) {
     out.push_str("# Per-tenant login site (always public — tenant guests log in here).\n");
     let _ = writeln!(out, "{fqdn} {{");
     // We preserve the original Host (`auth.<tenant>.<domain>`) when proxying
-    // upstream so the login service can derive the tenant from it.
+    // upstream so the login service can derive the tenant from it. Forward
+    // the URI too, so the login form retains the protected service's return URL.
     let _ = writeln!(out, "{INDENT}reverse_proxy {upstream} {{");
     let _ = writeln!(out, "{INDENT}{INDENT}header_up Host {{host}}");
+    let _ = writeln!(out, "{INDENT}{INDENT}header_up X-Tuntun-Forwarded-Uri {{uri}}");
     let _ = writeln!(out, "{INDENT}}}");
     out.push_str("}\n");
 }
@@ -199,6 +201,7 @@ mod tests {
         assert!(out.contains("auth.sweater.memorici.de {"));
         assert!(out.contains("reverse_proxy 127.0.0.1:7090 {"));
         assert!(out.contains("header_up Host {host}"));
+        assert!(out.contains("header_up X-Tuntun-Forwarded-Uri {uri}"));
         // No service sites yet.
         assert!(!out.contains("forward_auth"));
     }
@@ -359,6 +362,7 @@ mod tests {
 auth.sweater.memorici.de {
     reverse_proxy 127.0.0.1:7090 {
         header_up Host {host}
+        header_up X-Tuntun-Forwarded-Uri {uri}
     }
 }
 
