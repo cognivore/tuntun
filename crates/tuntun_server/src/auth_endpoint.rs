@@ -718,6 +718,52 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn login_form_preserves_service_return_url_from_proxy_uri() {
+        let config = ServerConfig {
+            domain: "fere.me".into(),
+            public_ip: String::new(),
+            tunnel_listen: String::new(),
+            auth_listen: String::new(),
+            login_listen: String::new(),
+            state_dir: PathBuf::new(),
+            caddy_bin: PathBuf::new(),
+            caddyfile_path: PathBuf::new(),
+            caddy_admin: String::new(),
+            caddy_log: PathBuf::new(),
+            acme_email: String::new(),
+            tenants_file: PathBuf::new(),
+            bastion_socket: PathBuf::new(),
+        };
+        let state = Arc::new(AuthState {
+            config: Arc::new(config),
+            signing_key: Arc::new(SigningKey::from_bytes(&[7; 32])),
+            rate_limit: Mutex::new(BTreeMap::new()),
+            revocation: Mutex::new(RevocationSet::default()),
+        });
+        let target = "https://baseball-live.sweater.fere.me/?run=demo&person=demo";
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "auth.sweater.fere.me".parse().expect("host"));
+        headers.insert(
+            "x-tuntun-forwarded-uri",
+            format!("/login?redirect={}", url_encode(target))
+                .parse()
+                .expect("URI"),
+        );
+        let response = login_get(axum::extract::State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("HTML");
+        let html = std::str::from_utf8(&body).expect("UTF-8");
+        assert!(html.contains(&format!(
+            "name=\"redirect\" value=\"{}\"",
+            html_escape(target)
+        )));
+        let tenant = TenantId::new("sweater").expect("tenant");
+        assert_eq!(sanitize_redirect(target, &tenant, "fere.me"), target);
+    }
+
     #[test]
     fn extract_tenant_strips_apex_and_returns_last_label() {
         let d = "fere.me";
