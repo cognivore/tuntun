@@ -41,8 +41,9 @@ pub async fn run(project_dir: &Path, config: Option<&Path>, dry_run: bool) -> Re
     );
     for (name, svc) in &spec.services {
         println!(
-            "  - {name}: {sub}.{domain} -> 127.0.0.1:{port} (auth={auth:?})",
+            "  - {name}: https://{sub}.{tenant}.{domain} -> 127.0.0.1:{port} (auth={auth:?})",
             sub = svc.subdomain,
+            tenant = spec.tenant,
             domain = spec.domain,
             port = svc.local_port,
             auth = svc.auth,
@@ -81,7 +82,7 @@ pub async fn run(project_dir: &Path, config: Option<&Path>, dry_run: bool) -> Re
 ///    project; used verbatim.
 /// 2. Otherwise the project *directory's* own name, exactly as the
 ///    `ProjectSpec::project` documentation promises.
-async fn resolve_project_id(spec: &ProjectSpec, project_dir: &Path) -> Result<ProjectId> {
+pub(super) async fn resolve_project_id(spec: &ProjectSpec, project_dir: &Path) -> Result<ProjectId> {
     if let Some(project) = &spec.project {
         return Ok(project.clone());
     }
