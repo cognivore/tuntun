@@ -489,6 +489,20 @@ Key properties:
   which scopes the forced-command behavior to the bastion port and leaves
   admin SSH on port 22 untouched.
 
+## Mosh UDP side-car
+
+A tenant with `tenants.<id>.moshPorts = { from; to; }` (within 60000-61000)
+gets those public UDP ports relayed to the same ports on the laptop, where
+`mosh-server` listens. The first datagram on a port with no open relay asks
+the tenant's session for a `StreamOpenBuiltin{Mosh{port}}` stream through the
+same opener the bastion uses; datagrams cross it framed as `len: u16 BE ||
+payload` (`tuntun_proto::datagram`). Replies go to the most recent sender.
+After a tunnel reconnect the next datagram opens a stream on the new session
+and `mosh-server` roams to the daemon's fresh local socket, so the mosh
+session survives. The laptop refuses ports outside 60000-61000 (`MoshPort`),
+so the server cannot reach arbitrary laptop-local UDP services. See
+`crates/tuntun_server/src/tunnel/mosh_relay.rs`.
+
 ## Daemon ↔ CLI handoff
 
 The first-cut implementation does **not** use a Unix-domain socket between
@@ -530,6 +544,7 @@ services.tuntun-server = {
     authorizedKeys = [
       "ed25519:AAAA..."   # laptop public keys; same keys gate the SSH bastion
     ];
+    moshPorts = { from = 60000; to = 60019; };  # optional UDP relay for mosh
   };
 };
 ```

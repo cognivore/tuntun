@@ -136,6 +136,13 @@ for PORT in 22 80 443 7000; do
     --group-id "$TUNTUN_SG_ID" \
     --protocol tcp --port $PORT --cidr 0.0.0.0/0
 done
+
+# 60000-60019/udp = mosh relay for tenants with `moshPorts` (match the
+# NixOS config; the NixOS firewall opens them, but EC2 filters first)
+aws ec2 authorize-security-group-ingress \
+  --region "$AWS_REGION" \
+  --group-id "$TUNTUN_SG_ID" \
+  --protocol udp --port 60000-60019 --cidr 0.0.0.0/0
 ```
 
 Later you can lock SSH down to your home IP — for now `0.0.0.0/0` is fine

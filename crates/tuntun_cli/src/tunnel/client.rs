@@ -25,12 +25,13 @@ use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode};
 
 use tuntun_auth::tunnel_auth::build_challenge_message;
 use tuntun_core::{
-    Ed25519PublicKey, Ed25519Signature, Fingerprint, LocalPort, ProjectId, SecretKey, SecretPort,
-    ServiceName, TenantId, TunnelClientId,
+    Ed25519PublicKey, Ed25519Signature, Fingerprint, LocalPort, MoshPort, ProjectId, SecretKey,
+    SecretPort, ServiceName, TenantId, TunnelClientId,
 };
 use tuntun_proto::{
-    encode_frame, AuthResponseFrame, BuiltinService, ControlFrame, FrameBuffer, HelloFrame,
-    ProjectRegistration, RegisterFrame, ServiceRegistration, PROTOCOL_VERSION,
+    encode_datagram, encode_frame, AuthResponseFrame, BuiltinService, ControlFrame, DatagramBuffer,
+    FrameBuffer, HelloFrame, ProjectRegistration, RegisterFrame, ServiceRegistration,
+    MAX_DATAGRAM_LEN, PROTOCOL_VERSION,
 };
 
 use crate::adapters::secret::RageveilSecrets;
@@ -47,8 +48,31 @@ const SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// await on it without holding the routing mutex.
 #[derive(Debug, Default)]
 struct StreamRouting {
-    map: BTreeMap<u32, LocalPort>,
+    map: BTreeMap<u32, LocalRoute>,
     notify: Arc<Notify>,
+}
+
+/// Where an inbound tunnel stream is delivered on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRoute {
+    /// Byte stream to `127.0.0.1:<port>` over TCP.
+    Tcp(LocalPort),
+    /// Framed datagrams to `mosh-server` on `127.0.0.1:<port>` over UDP.
+    Mosh(MoshPort),
+}
+
+impl LocalRoute {
+    /// Record `route` for `stream_id` and wake the acceptor waiting on it.
+    async fn publish(routing: &Mutex<StreamRouting>, stream_id: u32, route: Self) -> Result<()> {
+        let mut r = routing.lock().await;
+        anyhow::ensure!(r.map.len() < 256, "too many pending stream routes");
+        anyhow::ensure!(
+            r.map.insert(stream_id, route).is_none(),
+            "duplicate stream route {stream_id}"
+        );
+        r.notify.notify_waiters();
+        Ok(())
+    }
 }
 
 /// Snapshot of the projects the daemon should advertise to the server.
@@ -214,8 +238,14 @@ impl TunnelClient {
                             let routing = routing_for_acceptor.clone();
                             streams.spawn(async move {
                                 let id = stream.id().val();
-                                if let Some(port) = wait_for_routing(&routing, id).await {
-                                    if let Err(e) = pump_stream_to_local(stream, port).await {
+                                if let Some(route) = wait_for_routing(&routing, id).await {
+                                    let pumped = match route {
+                                        LocalRoute::Tcp(port) => pump_stream_to_local(stream, port).await,
+                                        LocalRoute::Mosh(port) => {
+                                            pump_datagrams_to_local(stream.compat(), port).await
+                                        }
+                                    };
+                                    if let Err(e) = pumped {
                                         tracing::debug!(stream_id = id, error = ?e, "local stream ended");
                                     }
                                 } else {
@@ -426,14 +456,7 @@ where
             ControlFrame::StreamOpen(open) => {
                 let key = (open.project.clone(), open.service.clone());
                 if let Some(port) = local_routing.get(&key) {
-                    let mut r = routing.lock().await;
-                    anyhow::ensure!(r.map.len() < 256, "too many pending stream routes");
-                    anyhow::ensure!(
-                        r.map.insert(open.stream_id, *port).is_none(),
-                        "duplicate stream route {}",
-                        open.stream_id
-                    );
-                    r.notify.notify_waiters();
+                    LocalRoute::publish(&routing, open.stream_id, LocalRoute::Tcp(*port)).await?;
                 } else {
                     tracing::warn!(
                         "StreamOpen for unknown service {}/{}",
@@ -442,23 +465,18 @@ where
                     );
                 }
             }
-            ControlFrame::StreamOpenBuiltin(open) => match open.kind {
-                BuiltinService::Ssh => {
-                    let mut r = routing.lock().await;
-                    anyhow::ensure!(r.map.len() < 256, "too many pending stream routes");
-                    anyhow::ensure!(
-                        r.map.insert(open.stream_id, ssh_local_port).is_none(),
-                        "duplicate stream route {}",
-                        open.stream_id
-                    );
-                    r.notify.notify_waiters();
-                    tracing::debug!(
-                        "builtin ssh stream {} -> 127.0.0.1:{}",
-                        open.stream_id,
-                        ssh_local_port.value()
-                    );
-                }
-            },
+            ControlFrame::StreamOpenBuiltin(open) => {
+                let route = match open.kind {
+                    BuiltinService::Ssh => LocalRoute::Tcp(ssh_local_port),
+                    BuiltinService::Mosh { port } => LocalRoute::Mosh(port),
+                };
+                LocalRoute::publish(&routing, open.stream_id, route).await?;
+                tracing::debug!(
+                    "builtin {:?} stream {} -> {route:?}",
+                    open.kind,
+                    open.stream_id
+                );
+            }
             ControlFrame::Ping(p) => {
                 let pong = ControlFrame::Pong(tuntun_proto::PongFrame { nonce: p.nonce });
                 write_frame(control, &pong).await?;
@@ -482,7 +500,7 @@ where
 async fn wait_for_routing(
     routing: &Arc<Mutex<StreamRouting>>,
     stream_id: u32,
-) -> Option<LocalPort> {
+) -> Option<LocalRoute> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let notify = routing.lock().await.notify.clone();
     loop {
@@ -491,8 +509,8 @@ async fn wait_for_routing(
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(port) = routing.lock().await.map.remove(&stream_id) {
-            return Some(port);
+        if let Some(route) = routing.lock().await.map.remove(&stream_id) {
+            return Some(route);
         }
         tokio::time::timeout_at(deadline, notified).await.ok()?;
     }
@@ -513,6 +531,69 @@ async fn pump_stream_to_local(yamux_stream: yamux::Stream, port: LocalPort) -> R
         .await
         .map_err(|e| anyhow!("pump: {e}"))?;
     Ok(())
+}
+
+/// Relay framed datagrams between a tunnel stream and `mosh-server` on
+/// `127.0.0.1:<port>`, until the server closes the stream. Each relay uses a
+/// fresh local socket, so after a tunnel reconnect `mosh-server` sees a new
+/// peer address and roams to it, as it would for a client changing networks.
+async fn pump_datagrams_to_local<S>(stream: S, port: MoshPort) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("bind local mosh relay socket")?;
+    socket
+        .connect((std::net::Ipv4Addr::LOCALHOST, port.value()))
+        .await
+        .with_context(|| format!("connect local mosh-server port {port}"))?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    // ICMP port-unreachable (no mosh-server on that port yet, or it exited)
+    // surfaces as ECONNREFUSED on a connected socket. It concerns one
+    // datagram, not the relay, so both directions carry on past it.
+    let refused = |e: &std::io::Error| e.kind() == std::io::ErrorKind::ConnectionRefused;
+    let to_local = async {
+        let mut inbox = DatagramBuffer::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .await
+                .context("read tunnel stream")?;
+            if n == 0 {
+                return Ok(());
+            }
+            inbox.push(&chunk[..n]);
+            while let Some(datagram) = inbox.try_pop() {
+                match socket.send(&datagram).await {
+                    Ok(_) => {}
+                    Err(e) if refused(&e) => {}
+                    Err(e) => return Err(anyhow::Error::new(e).context("send to mosh-server")),
+                }
+            }
+        }
+    };
+    let from_local = async {
+        let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
+        loop {
+            let n = match socket.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) if refused(&e) => continue,
+                Err(e) => return Err(anyhow::Error::new(e).context("receive from mosh-server")),
+            };
+            let framed = encode_datagram(&buf[..n]).context("frame datagram")?;
+            writer
+                .write_all(&framed)
+                .await
+                .context("write tunnel stream")?;
+            writer.flush().await.context("flush tunnel stream")?;
+        }
+    };
+    tokio::select! {
+        r = to_local => r,
+        r = from_local => r,
+    }
 }
 
 async fn read_one_frame<S>(s: &mut S, inbox: &mut FrameBuffer) -> Result<ControlFrame>
@@ -612,19 +693,71 @@ mod tests {
         let waiter_routing = routing.clone();
         let waiter = tokio::spawn(async move { wait_for_routing(&waiter_routing, 2).await });
         tokio::task::yield_now().await;
-        let port = LocalPort::new(22).expect("SSH port");
-        {
-            let mut state = routing.lock().await;
-            state.map.insert(2, port);
-            state.notify.notify_waiters();
-        }
+        let route = LocalRoute::Tcp(LocalPort::new(22).expect("SSH port"));
+        LocalRoute::publish(&routing, 2, route)
+            .await
+            .expect("route published");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), waiter)
                 .await
                 .expect("no missed wakeup")
                 .expect("waiter"),
-            Some(port)
+            Some(route)
         );
         assert!(routing.lock().await.map.is_empty());
+    }
+
+    async fn read_datagram<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Vec<u8> {
+        let mut len = [0u8; 2];
+        r.read_exact(&mut len).await.expect("length");
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        r.read_exact(&mut body).await.expect("body");
+        body
+    }
+
+    /// Datagrams reach the local mosh-server and its replies return framed,
+    /// even across a datagram refused while mosh-server was not yet up.
+    #[tokio::test]
+    async fn datagrams_reach_local_mosh_server_and_replies_come_back() {
+        // mosh-server binds in the mosh range; find a free port there.
+        let (mosh_server, port) = 'bind: {
+            for p in 60_000..=61_000 {
+                if let Ok(s) = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, p)).await
+                {
+                    break 'bind (s, MoshPort::new(p).expect("mosh port"));
+                }
+            }
+            panic!("no free UDP port in the mosh range");
+        };
+        let (mut tunnel, relay_end) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(pump_datagrams_to_local(relay_end, port));
+
+        tunnel
+            .write_all(&encode_datagram(b"ping").expect("frame"))
+            .await
+            .expect("write");
+        let mut buf = [0u8; 64];
+        let (n, relay_addr) =
+            tokio::time::timeout(Duration::from_secs(2), mosh_server.recv_from(&mut buf))
+                .await
+                .expect("datagram in time")
+                .expect("recv");
+        assert_eq!(&buf[..n], b"ping");
+
+        mosh_server
+            .send_to(b"pong", relay_addr)
+            .await
+            .expect("reply");
+        let reply = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut tunnel))
+            .await
+            .expect("reply in time");
+        assert_eq!(reply, b"pong");
+
+        drop(tunnel);
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay ends with the stream")
+            .expect("relay task")
+            .expect("clean end");
     }
 }

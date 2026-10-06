@@ -19,7 +19,7 @@ use crate::dns_reconciler::Reconciler;
 use crate::registry::Registry;
 use crate::tls::load_or_generate;
 use crate::tunnel::acceptor::Acceptor;
-use crate::tunnel::bastion;
+use crate::tunnel::{bastion, mosh_relay};
 
 pub async fn run(config: Option<&Path>) -> Result<()> {
     let cfg = Arc::new(ServerConfig::load(config).await?);
@@ -92,6 +92,14 @@ pub async fn run(config: Option<&Path>) -> Result<()> {
             .await
             .context("SSH bastion")
     });
+    for (tenant, range) in cfg.load_tenants().await?.mosh_ranges()? {
+        let mosh_registry = registry.clone();
+        workers.spawn(async move {
+            mosh_relay::run_tenant(tenant, range, mosh_registry)
+                .await
+                .context("mosh relay")
+        });
+    }
     let caddy = supervisor.clone();
     workers.spawn(async move { caddy.supervise().await });
     let acceptor = Arc::new(Acceptor::new(cfg, registry, supervisor, tls_handle));

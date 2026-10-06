@@ -24,10 +24,12 @@
 #![doc(html_root_url = "https://docs.rs/tuntun_proto/0.1.0")]
 
 pub mod codec;
+pub mod datagram;
 pub mod error;
 pub mod frames;
 
 pub use codec::{decode_frame, encode_frame, FrameBuffer, MAX_FRAME_LEN};
+pub use datagram::{encode_datagram, DatagramBuffer, MAX_DATAGRAM_LEN};
 pub use error::ProtoError;
 pub use frames::{
     AuthChallengeFrame, AuthPolicy, AuthRequestFrame, AuthResponseFrame, AuthResultFrame,

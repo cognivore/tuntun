@@ -47,6 +47,25 @@ devices do not replace the primary reverse-SSH target. Upgrade the server before
 the clients: management sessions now use the append-only `ControlOnly` frame
 and no longer register a competing tunnel.
 
+For a terminal that survives network changes and tunnel reconnects, use mosh
+from an enrolled laptop:
+
+```console
+mosh --experimental-remote-ip=remote --server="printf 'MOSH IP 18.171.39.154\n'; mosh-server" -p 60000:60019 ssh.sweater.fere.me
+```
+
+SSH starts `mosh-server` on the Mac through the bastion as usual. Its UDP
+traffic goes to the server, which relays ports 60000-60019 (the tenant's
+`moshPorts`) through the tunnel to the same port on the Mac. Both unusual
+flags are required. mosh's default address discovery replaces the SSH
+configuration's `ProxyCommand`, which is the bastion hop, and `local`
+discovery makes SSH dial the resolved IP, which is the server's admin sshd.
+`remote` keeps the SSH route intact; the `MOSH IP` line then tells the client
+to send UDP to the server's public address, because the Mac only sees the
+tunnel's loopback connection. Each concurrent session needs one port in the
+range, and the Mac needs `mosh` installed. If the tunnel reconnects, the
+session resumes on mosh's next packet instead of dropping.
+
 To repeat the live failure test from the Mac after enrollment:
 
 ```console

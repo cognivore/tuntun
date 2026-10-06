@@ -31,12 +31,10 @@ pub use crate::error::{Error, Result};
 pub use crate::http::{HttpHeader, HttpMethod, HttpRequest, HttpResponse, HttpStatus, HttpUrl};
 pub use crate::id::IdError;
 pub use crate::ids::{
-    DnsName, DnsRecordId, Domain, Fqdn, LocalPort, ProjectId, SecretKey, ServiceName, ServicePort,
-    Subdomain, TenantId, Ttl, TunnelClientId,
+    DnsName, DnsRecordId, Domain, Fqdn, LocalPort, MoshPort, ProjectId, SecretKey, ServiceName,
+    ServicePort, Subdomain, TenantId, Ttl, TunnelClientId,
 };
-pub use crate::ports::{
-    ClockPort, DnsPort, FsPort, HttpPort, ProcessPort, SecretPort,
-};
+pub use crate::ports::{ClockPort, DnsPort, FsPort, HttpPort, ProcessPort, SecretPort};
 pub use crate::process::{ProcessExit, ProcessExitCode, ProcessSignal, ProcessSpec};
 pub use crate::secret::SecretValue;
 pub use crate::time::{Duration, Instant, Timestamp};

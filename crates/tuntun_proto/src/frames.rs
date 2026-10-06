@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
 use tuntun_core::{
-    Ed25519PublicKey, Ed25519Signature, Fqdn, Nonce, ProjectId, ServiceName, ServicePort,
+    Ed25519PublicKey, Ed25519Signature, Fqdn, MoshPort, Nonce, ProjectId, ServiceName, ServicePort,
     Subdomain, TenantId, TunnelClientId,
 };
 
@@ -363,6 +363,10 @@ pub enum BuiltinService {
     /// Reverse-SSH bastion. The client should pipe the stream to its local
     /// `sshd` (typically `127.0.0.1:22`).
     Ssh,
+    /// UDP relay for a mosh session. The stream carries datagrams framed by
+    /// [`crate::datagram`]; the client exchanges them with
+    /// `127.0.0.1:<port>`, where `mosh-server` listens.
+    Mosh { port: MoshPort },
 }
 
 /// Server -> Client: a new public connection arrived for a built-in side-car

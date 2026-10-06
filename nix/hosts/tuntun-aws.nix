@@ -55,6 +55,9 @@
         # Private half lives in rageveil at tuntun/tunnel-private-key.
         "ed25519:NQPqMhZzw8AXysGuu1XJYzuHT4S16n7zjxUIFFiQoUo"
       ];
+      # mosh into septnesis through the tunnel. The EC2 security group must
+      # also admit UDP 60000-60019.
+      moshPorts = { from = 60000; to = 60019; };
     };
   };
 

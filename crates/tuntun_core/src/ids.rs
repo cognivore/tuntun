@@ -77,6 +77,14 @@ define_numeric_id!(
 );
 
 define_numeric_id!(
+    /// UDP port of a mosh session relayed through the tunnel. The same number
+    /// is bound publicly on the server and by `mosh-server` on the laptop, so
+    /// it is confined to mosh's default range: a server can never direct
+    /// datagrams at an arbitrary laptop-local UDP service.
+    pub MoshPort, u16, min = 60000u16, max = 61000u16,
+);
+
+define_numeric_id!(
     /// DNS TTL in seconds. Porkbun minimum is 60, but we allow shorter values
     /// for testing where the API returns an explicit error.
     pub Ttl, u32, min = 1u32,
@@ -91,6 +99,14 @@ mod tests {
         let t = TenantId::new("memorici-de").unwrap();
         assert_eq!(t.as_str(), "memorici-de");
         assert_eq!(t.to_string(), "memorici-de");
+    }
+
+    #[test]
+    fn mosh_port_is_confined_to_the_mosh_range() {
+        assert!(MoshPort::new(59_999).is_err());
+        assert_eq!(MoshPort::new(60_000).unwrap().value(), 60_000);
+        assert_eq!(MoshPort::new(61_000).unwrap().value(), 61_000);
+        assert!(MoshPort::new(61_001).is_err());
     }
 
     #[test]

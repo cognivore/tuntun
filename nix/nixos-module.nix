@@ -56,12 +56,40 @@ let
           `scripts/regen-client-keys.rs` on the laptop side.
         '';
       };
+
+      moshPorts = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            from = lib.mkOption {
+              type = lib.types.port;
+              description = "First UDP port of the range.";
+            };
+            to = lib.mkOption {
+              type = lib.types.port;
+              description = "Last UDP port of the range (inclusive).";
+            };
+          };
+        });
+        default = null;
+        example = { from = 60000; to = 60019; };
+        description = ''
+          Public UDP ports relayed through this tenant's tunnel to the
+          laptop's `mosh-server` on the same port, one concurrent mosh
+          session per port. The range must lie within mosh's 60000-61000
+          and must not overlap another tenant's. Clients connect with
+          `mosh --experimental-remote-ip=remote
+          --server="printf 'MOSH IP <publicIp>\n'; mosh-server"
+          -p <from>:<to> ssh.<tenant>.<domain>` (see README.md).
+        '';
+      };
     };
   };
 
+  moshTenants = lib.filterAttrs (_: t: t.moshPorts != null) cfg.tenants;
+
   tenantsAuthorizedKeysJson = pkgs.writeText "tuntun-tenants.json" (
     builtins.toJSON (
-      builtins.mapAttrs (_: t: { authorizedKeys = t.authorizedKeys; }) cfg.tenants
+      builtins.mapAttrs (_: t: { inherit (t) authorizedKeys moshPorts; }) cfg.tenants
     )
   );
 
@@ -305,7 +333,11 @@ in
         assertion = cfg.tenants != { };
         message = "services.tuntun-server: at least one tenant must be defined.";
       }
-    ];
+    ] ++ lib.mapAttrsToList (tName: t: {
+      assertion = 60000 <= t.moshPorts.from && t.moshPorts.from <= t.moshPorts.to
+        && t.moshPorts.to <= 61000;
+      message = "services.tuntun-server.tenants.${tName}.moshPorts must be a non-empty range within 60000-61000.";
+    }) moshTenants;
 
     networking.firewall = lib.mkIf cfg.openFirewall {
       allowedTCPPorts = [
@@ -313,6 +345,7 @@ in
         443
         (lib.toInt (lib.last (lib.splitString ":" cfg.tunnelListen)))
       ] ++ lib.optional cfg.ssh.enable cfg.ssh.bastionPort;
+      allowedUDPPortRanges = lib.mapAttrsToList (_: t: t.moshPorts) moshTenants;
     };
 
     users.users.tuntun = {

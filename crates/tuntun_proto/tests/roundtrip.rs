@@ -11,18 +11,18 @@ use std::fmt::Write as _;
 use serde_bytes::ByteBuf;
 
 use tuntun_core::{
-    Ed25519PublicKey, Ed25519Signature, Fqdn, Nonce, ProjectId, ServiceName, ServicePort,
+    Ed25519PublicKey, Ed25519Signature, Fqdn, MoshPort, Nonce, ProjectId, ServiceName, ServicePort,
     Subdomain, TenantId, TunnelClientId,
 };
 use tuntun_proto::{
-    decode_frame, encode_frame, AuthChallengeFrame, AuthPolicy, AuthRequestFrame,
+    decode_frame, encode_datagram, encode_frame, AuthChallengeFrame, AuthPolicy, AuthRequestFrame,
     AuthResponseFrame, AuthResultFrame, BlessKeyAckFrame, BlessKeyFrame, BlessingEntry,
-    BlessingsListFrame, BuiltinService, ControlFrame, DeregisterFrame, ErrorCode, ErrorFrame,
-    FrameBuffer, HealthCheckSpec, HelloFrame, ListBlessingsFrame, PingFrame, PongFrame,
+    BlessingsListFrame, BuiltinService, ControlFrame, DatagramBuffer, DeregisterFrame, ErrorCode,
+    ErrorFrame, FrameBuffer, HealthCheckSpec, HelloFrame, ListBlessingsFrame, PingFrame, PongFrame,
     ProjectRegistration, ProtoError, RegisterFrame, RegisteredFrame, ServiceAllocation,
     ServiceRegistration, StreamCloseFrame, StreamCloseReason, StreamDataFrame,
     StreamOpenBuiltinFrame, StreamOpenFrame, UnblessKeyAckFrame, UnblessKeyFrame, WelcomeFrame,
-    MAX_FRAME_LEN, PROTOCOL_VERSION,
+    MAX_DATAGRAM_LEN, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 
 fn tenant() -> TenantId {
@@ -174,6 +174,12 @@ fn all_frames() -> Vec<ControlFrame> {
         ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame {
             stream_id: 99,
             kind: BuiltinService::Ssh,
+        }),
+        ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame {
+            stream_id: 101,
+            kind: BuiltinService::Mosh {
+                port: MoshPort::new(60_001).expect("valid mosh port"),
+            },
         }),
         ControlFrame::BlessKey(BlessKeyFrame {
             public_key: pubkey(),
@@ -345,6 +351,55 @@ fn golden_ping_frame_hex() {
     let (decoded, consumed) = decode_frame(&wire).expect("decode");
     assert_eq!(consumed, wire.len());
     assert_eq!(decoded, frame);
+}
+
+#[test]
+fn a_mosh_port_outside_the_mosh_range_does_not_decode() {
+    let frame = ControlFrame::StreamOpenBuiltin(StreamOpenBuiltinFrame {
+        stream_id: 7,
+        kind: BuiltinService::Mosh {
+            port: MoshPort::new(60_000).expect("valid mosh port"),
+        },
+    });
+    let mut wire = encode_frame(&frame).expect("encode");
+    // Body: tag 0x0f (StreamOpenBuiltin), stream id 7, tag 0x01 (Mosh), then
+    // the varint port. Rewrite 60000 (e0 d4 03) as 53 (35), the DNS port.
+    assert_eq!(&wire[4..], [0x0f, 0x07, 0x01, 0xe0, 0xd4, 0x03]);
+    wire.truncate(7);
+    wire.push(0x35);
+    wire[0] = 4;
+    assert!(decode_frame(&wire).is_err());
+}
+
+#[test]
+fn datagrams_keep_their_boundaries_across_arbitrary_reads() {
+    let largest = vec![7; MAX_DATAGRAM_LEN];
+    let datagrams: [&[u8]; 4] = [b"", b"a", &[0xff; 1400], &largest];
+    let mut wire = Vec::new();
+    for d in datagrams {
+        wire.extend(encode_datagram(d).expect("encode datagram"));
+    }
+    for chunk_len in [1, 3, 1401, wire.len()] {
+        let mut buf = DatagramBuffer::new();
+        let mut out = Vec::new();
+        for chunk in wire.chunks(chunk_len) {
+            buf.push(chunk);
+            while let Some(d) = buf.try_pop() {
+                out.push(d);
+            }
+        }
+        assert!(buf.is_empty());
+        assert_eq!(out.len(), datagrams.len());
+        for (got, want) in out.iter().zip(datagrams) {
+            assert_eq!(&got[..], want);
+        }
+    }
+}
+
+#[test]
+fn an_oversize_datagram_is_refused() {
+    let err = encode_datagram(&vec![0; MAX_DATAGRAM_LEN + 1]).expect_err("too large");
+    assert!(matches!(err, ProtoError::FrameTooLarge { len } if len == MAX_DATAGRAM_LEN + 1));
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
