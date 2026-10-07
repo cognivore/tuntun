@@ -33,7 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode};
@@ -69,6 +69,13 @@ pub async fn handle_connection(
     supervisor: Arc<CaddySupervisor>,
     tls: Arc<TlsAcceptorHandle>,
 ) -> Result<()> {
+    // Nagle's algorithm holds a small segment until every earlier one is
+    // acknowledged, which charged each yamux frame a full round trip. The
+    // write buffer below hands TCP whole frames, so nothing is gained by
+    // waiting.
+    sock.set_nodelay(true)
+        .context("set TCP_NODELAY on tunnel socket")?;
+
     // 1. TLS accept.
     let tls_stream = tokio::time::timeout(Duration::from_secs(10), tls.acceptor.accept(sock))
         .await
@@ -85,8 +92,16 @@ pub async fn handle_connection(
     // Wrapping the connection in `Arc<Mutex>` deadlocks: the lock must be
     // held while awaiting an inbound, but that blocks anyone wanting to
     // open an outbound. Single-owner + a command channel sidesteps that.
-    let mut yamux_conn =
-        YamuxConnection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Server);
+    //
+    // yamux writes every frame as two calls, its 12-byte header and then its
+    // body, and flushes once the frame is complete. Each call on a TLS stream
+    // becomes its own record and TCP segment; buffering until yamux's flush
+    // sends the frame as one.
+    let mut yamux_conn = YamuxConnection::new(
+        BufWriter::new(tls_stream).compat(),
+        YamuxConfig::default(),
+        Mode::Server,
+    );
 
     // 3. The first inbound stream is the control stream. We poll it once
     // here so the rest of the session can read/write on it — and *then*

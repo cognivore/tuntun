@@ -13,11 +13,11 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::task::AbortOnDropHandle;
 use tuntun_config::ProjectSpec;
 use tuntun_proto::heartbeat::Heartbeat;
@@ -184,6 +184,12 @@ impl TunnelClient {
         .await
         .context("TCP connect timed out")?
         .with_context(|| format!("connect to {}", self.config.server_host))?;
+        // Nagle's algorithm holds a small segment until every earlier one is
+        // acknowledged, which charged each yamux frame a full round trip.
+        // `tunnel_transport` hands TCP whole frames, so nothing is gained by
+        // waiting.
+        tcp.set_nodelay(true)
+            .context("set TCP_NODELAY on tunnel socket")?;
 
         // 2. TLS handshake. Server name doesn't matter for our pinned
         // verifier; pass a placeholder so rustls is happy.
@@ -201,8 +207,11 @@ impl TunnelClient {
         // resulting Stream has its own buffer and does not require the
         // Connection to read/write — but the Connection must keep being
         // polled, otherwise nothing flows.
-        let mut yamux_conn =
-            YamuxConnection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
+        let mut yamux_conn = YamuxConnection::new(
+            tunnel_transport(tls_stream),
+            YamuxConfig::default(),
+            Mode::Client,
+        );
 
         // 4. Open the control stream (first outbound stream).
         let control_stream =
@@ -373,6 +382,17 @@ impl TunnelClient {
 
         control_loop_result
     }
+}
+
+/// yamux writes every frame as two calls, its 12-byte header and then its
+/// body, and flushes once the frame is complete. Each call on a TLS stream
+/// becomes its own record and TCP segment; buffering until yamux's flush
+/// sends the frame as one.
+fn tunnel_transport<T>(tls: T) -> Compat<BufWriter<T>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    BufWriter::new(tls).compat()
 }
 
 async fn ensure_state_dir(path: &std::path::Path) -> Result<()> {
@@ -705,6 +725,99 @@ mod tests {
             Some(route)
         );
         assert!(routing.lock().await.map.is_empty());
+    }
+
+    /// Records the length of every write that reaches the wrapped stream.
+    struct WriteLog<T> {
+        inner: T,
+        writes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteLog<T> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteLog<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let std::task::Poll::Ready(Ok(n)) = polled {
+                self.writes.lock().expect("write log").push(n);
+            }
+            polled
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A one-byte write on a tunnel stream is a 13-byte yamux frame: a
+    /// 12-byte header and the byte. Written as two pieces, TLS would send two
+    /// records, and TCP two segments.
+    #[tokio::test]
+    async fn a_small_yamux_frame_reaches_the_tunnel_in_one_write() {
+        let (laptop_io, server_io) = tokio::io::duplex(64 * 1024);
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut laptop = YamuxConnection::new(
+            tunnel_transport(WriteLog {
+                inner: laptop_io,
+                writes: writes.clone(),
+            }),
+            YamuxConfig::default(),
+            Mode::Client,
+        );
+        let mut server =
+            YamuxConnection::new(server_io.compat(), YamuxConfig::default(), Mode::Server);
+
+        let outbound = poll_fn(|cx| laptop.poll_new_outbound(cx))
+            .await
+            .expect("open stream");
+        let _laptop_driver = AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(Ok(_)) = poll_fn(|cx| laptop.poll_next_inbound(cx)).await {}
+        }));
+        let mut outbound = outbound.compat();
+        outbound.write_all(b"k").await.expect("write");
+        outbound.flush().await.expect("flush");
+
+        let inbound = tokio::time::timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| server.poll_next_inbound(cx)),
+        )
+        .await
+        .expect("stream arrives in time")
+        .expect("connection open")
+        .expect("inbound stream");
+        let _server_driver = AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(Ok(_)) = poll_fn(|cx| server.poll_next_inbound(cx)).await {}
+        }));
+        let mut inbound = inbound.compat();
+        let mut byte = [0u8; 1];
+        inbound.read_exact(&mut byte).await.expect("read");
+        assert_eq!(&byte, b"k");
+
+        let writes = writes.lock().expect("write log").clone();
+        assert!(writes.contains(&13), "frame written whole: {writes:?}");
+        assert!(!writes.contains(&1), "no bare frame body: {writes:?}");
     }
 
     async fn read_datagram<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Vec<u8> {
