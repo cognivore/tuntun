@@ -39,6 +39,19 @@ let
     server_domain = "${cfg.bastion.serverDomain}"
   '';
 
+  # The interactive CLI must use the same configuration as the daemon.
+  # Wrapping avoids Darwin's config-directory convention differing from XDG,
+  # while --config and an explicit TUNTUN_CONFIG still override this default.
+  managedCliPkg = pkgs.symlinkJoin {
+    name = "tuntun-cli-managed";
+    paths = [ cliPkg ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram "$out/bin/tuntun" \
+        --set-default TUNTUN_CONFIG ${lib.escapeShellArg daemonConfigToml}
+    '';
+  };
+
   bastionHostName = "ssh.${cfg.defaultTenant}.${cfg.bastion.serverDomain}";
 
   # Private alias for the bastion-jump leg. Distinct from `bastionHostName`
@@ -49,7 +62,7 @@ let
 
   isDarwin = pkgs.stdenv.isDarwin;
 
-  daemonExec = "${cliPkg}/bin/tuntun daemon --config ${daemonConfigToml}";
+  daemonExec = "${managedCliPkg}/bin/tuntun daemon --config ${daemonConfigToml}";
 
   # Build a tuntun_config::ProjectSpec as an attrset for one declarative
   # project. Field names match the Rust serde shape exactly: camelCase
@@ -285,7 +298,7 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
-      home.packages = [ cliPkg ];
+      home.packages = [ managedCliPkg ];
 
       home.activation.tuntunStateDir = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
         mkdir -p "${cfg.stateDir}"
